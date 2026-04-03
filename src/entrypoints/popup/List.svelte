@@ -1,5 +1,4 @@
 <script>
-  import { generateBookMark } from "./utils";
   import {
     isFileSystemAccessSupported,
     exportToSQLite,
@@ -9,7 +8,8 @@
     downloadDatabaseFile,
   } from "../../utils/file";
   import { initSqlite } from "../../utils/db";
-  import { exportToS3, isS3Configured } from "../../utils/s3";
+  import { isS3Configured } from "../../utils/s3";
+  import { syncAllBooksToS3, fetchBookData, getWrVidFromCookie } from "../../utils/sync";
   import Settings from "./Settings.svelte";
 
   export let userVid;
@@ -47,13 +47,28 @@
     }
   }
 
-  function getNoteBooks() {
+  async function getNoteBooks() {
+    // 优先从 cookie 读取 wr_vid
+    const cookieVid = await getWrVidFromCookie();
+    if (cookieVid) {
+      userVid = cookieVid;
+      console.log("[List] 优先使用 cookie 的 wr_vid 作为 userVid:", userVid);
+    }
+
     fetch("https://weread.qq.com/api/user/notebook")
       .then((response) => response.json())
       .then((data) => {
         books = data.books.map((val) => val.book);
         if (books.length > 0) {
           selectedBook = books[0].bookId;
+        }
+        // 如果 cookie 没有，再尝试从 API 响应兜底
+        if (!userVid) {
+          const fixedUserVid = data.userVid || data.vid || data.books?.[0]?.userVid || data.books?.[0]?.vid;
+          if (fixedUserVid) {
+            userVid = String(fixedUserVid);
+            console.log("[List] 从 notebook API 获取固定 userVid:", userVid);
+          }
         }
       });
   }
@@ -64,24 +79,15 @@
     selectedBook = book.bookId;
   }
 
-  function exportBookmarks() {
-    if (!selectedBook) return;
-    Promise.all([`https://weread.qq.com/web/book/bookmarklist?bookId=${selectedBook}`, `https://weread.qq.com/web/review/list?bookId=${selectedBook}&mine=1&listType=11&maxIdx=0&count=0&listMode=2&synckey=0&userVid=${userVid}`, `https://weread.qq.com/web/book/getProgress?bookId=${selectedBook}`].map((url) => fetch(url).then((resp) => resp.json()))).then((data) => {
-      // bookRemark\Review\Reading progress
-      let [markData, reviewData, progressData] = data;
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(generateBookMark(markData, reviewData, progressData)).then(() => {
-          alert("已复制 Markdown 到粘贴板");
-        });
-      }
-    });
-  }
-
   /**
    * 导出到 SQLite 数据库
    */
   async function exportToDatabase() {
-    if (!selectedBook || isExporting) return;
+    if (isExporting) return;
+    if (books.length === 0) {
+      alert("暂无书籍可导出");
+      return;
+    }
 
     isExporting = true;
     /** @type {string[]} */
@@ -115,6 +121,48 @@
       const isSupported = isFileSystemAccessSupported();
       diagnose("浏览器支持", { isSupported });
 
+      // 检查是否配置了 S3，如果配置了优先使用 S3 导出
+      const useS3 = await isS3Configured();
+      diagnose("导出方式选择", { useS3, s3Configured: useS3, isSupported });
+
+      if (useS3) {
+        // S3 导出模式：调用核心同步模块
+        diagnose("开始 S3 同步", { bookCount: books.length });
+        const result = await syncAllBooksToS3();
+
+        if (result.success) {
+          const s = result.stats;
+          let message = "同步到 S3 成功！";
+          if (s) {
+            const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
+            if (hasChanges) {
+              const details = [];
+              if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
+              if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
+              if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
+              if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
+              message += `\n\n本次变更：涉及 ${s.changedBooks} 本书`;
+              if (details.length > 0) message += `\n${details.join("，")}`;
+            } else {
+              message += "\n\n本次无新增变更，所有笔记已是最新。";
+            }
+            message += `\n\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
+            if (result.url) message += `\n\n文件地址: ${result.url}`;
+          }
+          alert(message);
+        } else {
+          throw new Error(result.message);
+        }
+        return;
+      }
+
+      // 本地文件导出模式（保持单本书逻辑）
+      if (!selectedBook) {
+        alert("请先选择一本书");
+        isExporting = false;
+        return;
+      }
+
       // 获取上次同步状态（用于增量更新）
       let db = null;
       let fileHandle = null;
@@ -130,136 +178,35 @@
         }
       }
 
-      // 获取上次 synckey
-      const lastSyncKey = getSyncKeyForApi(db, userVid, selectedBook);
-
       // 获取书籍数据
       const book = books.find((b) => b.bookId === selectedBook);
       if (!book) {
         throw new Error("未找到选中的书籍");
       }
 
-      // 调用 API 获取数据（携带 synckey 获取增量数据）
-      diagnose("调用 API 获取数据", { bookId: selectedBook, lastSyncKey });
-      // 如果没有 userVid，尝试从 markData 获取
-      let effectiveUserVid = userVid;
-      if (!effectiveUserVid) {
-        console.log("[List] userVid 为空，尝试从 markData 获取");
-      }
-      const [markData, reviewData, progressData] = await Promise.all([
-        fetch(
-          `https://weread.qq.com/web/book/bookmarklist?bookId=${selectedBook}&synckey=${lastSyncKey}`
-        ).then((resp) => resp.json()),
-        fetch(
-          `https://weread.qq.com/web/review/list?bookId=${selectedBook}&mine=1&listType=11&maxIdx=0&count=0&listMode=2&synckey=0&userVid=${userVid}`
-        ).then((resp) => resp.json()),
-        fetch(
-          `https://weread.qq.com/web/book/getProgress?bookId=${selectedBook}`
-        ).then((resp) => resp.json()),
-      ]);
+      const { bookData, reviewData, progressInfo, markData } = await fetchBookData(
+        book,
+        userVid || "",
+        db
+      );
 
-      // 从 markData 或 reviewData 中提取 userVid（如果之前没有）
+      // 获取 effectiveUserVid（优先 cookie -> 已有 userVid -> API 响应 -> 兜底）
+      let effectiveUserVid = userVid || (await getWrVidFromCookie());
       if (!effectiveUserVid) {
         effectiveUserVid = markData?.userVid || markData?.user?.vid || reviewData?.userVid || reviewData?.user?.vid || "";
-        console.log("[List] 从 API 响应获取 userVid:", effectiveUserVid);
-        diagnose("获取 userVid", { effectiveUserVid, fromMarkData: !!markData?.userVid, fromReviewData: !!reviewData?.userVid });
       }
-
-      // 如果还是没有 userVid，使用一个默认值
       if (!effectiveUserVid) {
         effectiveUserVid = "unknown_user";
-        console.warn("[List] 无法获取 userVid，使用默认值");
-        diagnose("userVid 警告", { message: "使用默认值 unknown_user" });
-      }
-
-      // 构建书籍数据
-      const bookData = {
-        book: {
-          bookId: book.bookId,
-          title: book.title,
-          author: book.author,
-          cover: book.cover,
-          format: book.format || "epub",
-        },
-        chapters: markData.chapters || [],
-        updated: markData.updated || [],
-        removed: markData.removed || [],
-        synckey: markData.synckey || lastSyncKey + 1,
-      };
-
-      // 构建进度数据
-      const progressInfo = progressData.book
-        ? {
-            readingTime: progressData.book.readingTime,
-            startReadingTime: progressData.book.startReadingTime,
-            finishTime: progressData.book.finishTime,
-          }
-        : undefined;
-
-      // 检查是否配置了 S3，如果配置了优先使用 S3 导出
-      const useS3 = await isS3Configured();
-      diagnose("导出方式选择", { useS3, s3Configured: useS3, isSupported });
-
-      if (useS3) {
-        // S3 导出模式
-        diagnose("开始 S3 导出", { bookId: selectedBook, bookTitle: book.title });
-        await initSqlite();
-
-        // 动态导入 db 模块
-        const dbModule = await import("../../utils/db");
-
-        // 尝试从文件加载现有数据库，否则创建新数据库
-        let s3Db = null;
-        if (db) {
-          s3Db = db;
-        } else if (isSupported && hasFileHandle) {
-          // 尝试从本地文件加载（用于合并）
-          try {
-            const result = await requestFileAccess();
-            s3Db = result.db;
-          } catch (e) {
-            console.log("[List] 无法加载本地文件，创建新数据库用于 S3 导出:", e);
-          }
-        }
-
-        if (!s3Db) {
-          s3Db = dbModule.createDatabase();
-        }
-
-        // 同步数据到数据库
-        const safeReviewData = reviewData || { reviews: [] };
-        dbModule.syncBookToDatabase(
-          s3Db,
-          effectiveUserVid,
-          bookData,
-          safeReviewData,
-          progressInfo
-        );
-
-        // 上传到 S3
-        const result = await exportToS3(s3Db, book.title);
-
-        // 关闭数据库
-        s3Db.close();
-
-        if (result.success) {
-          alert(`《${book.title}》导出到 S3 成功！\n\n${result.message}${result.url ? "\n\n文件地址: " + result.url : ""}`);
-        } else {
-          throw new Error(result.message);
-        }
-        return;
       }
 
       if (isSupported && !db) {
         // 使用自动文件管理模式（首次导出）
         diagnose("调用 exportToSQLite", { userVid: effectiveUserVid, bookId: selectedBook });
-        // 确保 reviewData 有正确的结构
-        const safeReviewData = reviewData || { reviews: [] };
-        diagnose("reviewData 检查", { hasReviewData: !!reviewData, reviewCount: safeReviewData.reviews?.length || 0 });
+        diagnose("reviewData 检查", { hasReviewData: !!reviewData, reviewCount: reviewData.reviews?.length || 0 });
         const result = await exportToSQLite(
           effectiveUserVid,
           bookData,
-          safeReviewData,
+          reviewData,
           progressInfo,
           true
         );
@@ -378,9 +325,6 @@
     <i class="mdui-icon material-icons">
       {s3Configured ? "cloud_upload" : "storage"}
     </i>
-  </button>
-  <button class="mdui-btn mdui-btn-icon" on:click={exportBookmarks}>
-    <i class="mdui-icon material-icons">content_copy</i>
   </button>
 </div>
 

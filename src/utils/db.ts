@@ -298,6 +298,8 @@ export function upsertChapter(
 
 /**
  * 插入或更新划线数据
+ * 通过 JS 层逐字段比较，确保只有真正发生变化时才执行更新，避免 updated_at 刷新导致误报
+ * @param stats 可选统计对象，用于精确记录新增/更新数量
  */
 export function upsertHighlight(
   db: any,
@@ -313,61 +315,120 @@ export function upsertHighlight(
     type?: number;
     createTime?: number;
     updated?: number;
-  }
+  },
+  stats?: { highlightsAdded?: number; highlightsUpdated?: number }
 ): void {
+  const bookmarkId = mark.bookmarkId || "";
+
+  // 查询现有记录
+  const existing = db.exec(
+    "SELECT chapter_uid, chapter_title, range, mark_text, style, type FROM highlights WHERE user_vid = ? AND bookmark_id = ?",
+    [userVid, bookmarkId]
+  );
+
+  const hasExisting = existing.length > 0 && existing[0].values.length > 0;
+
+  if (!hasExisting) {
+    // 新增
+    const stmt = db.prepare(`
+      INSERT INTO highlights
+        (user_vid, bookmark_id, book_id, chapter_uid, chapter_title, range, mark_text, style, type, created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(?, 'unixepoch'), datetime(?, 'unixepoch'))
+    `);
+    const values = [
+      userVid,
+      bookmarkId,
+      bookId,
+      mark.chapterUid ?? 0,
+      mark.chapterTitle || "",
+      mark.range || "",
+      mark.markText || "",
+      mark.style ?? 0,
+      mark.type ?? 1,
+      mark.createTime ?? Date.now() / 1000,
+      mark.updated ?? Date.now() / 1000,
+    ];
+    const undefinedIndex = values.findIndex(v => v === undefined);
+    if (undefinedIndex !== -1) {
+      console.error("[upsertHighlight] 发现 undefined 值，索引:", undefinedIndex, "mark:", mark);
+      throw new Error(`SQL 绑定错误: 参数 ${undefinedIndex} 为 undefined`);
+    }
+    stmt.run(values);
+    stmt.free();
+    if (stats) stats.highlightsAdded = (stats.highlightsAdded || 0) + 1;
+    return;
+  }
+
+  // 已存在：逐字段比较
+  const [oldChapterUid, oldChapterTitle, oldRange, oldMarkText, oldStyle, oldType] = existing[0].values[0];
+  const changed =
+    Number(oldChapterUid) !== (mark.chapterUid ?? 0) ||
+    (oldChapterTitle || "") !== (mark.chapterTitle || "") ||
+    (oldRange || "") !== (mark.range || "") ||
+    (oldMarkText || "") !== (mark.markText || "") ||
+    Number(oldStyle) !== (mark.style ?? 0) ||
+    Number(oldType) !== (mark.type ?? 1);
+
+  if (!changed) {
+    // 完全相同，跳过
+    return;
+  }
+
+  // 真正发生变化，执行精确 UPDATE（避免 ON CONFLICT DO UPDATE 刷新 updated_at 的误报）
   const stmt = db.prepare(`
-    INSERT INTO highlights
-      (user_vid, bookmark_id, book_id, chapter_uid, chapter_title, range, mark_text, style, type, created_at, updated_at)
-    VALUES
-      (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(?, 'unixepoch'), datetime(?, 'unixepoch'))
-    ON CONFLICT(user_vid, bookmark_id) DO UPDATE SET
-      chapter_uid = excluded.chapter_uid,
-      chapter_title = excluded.chapter_title,
-      range = excluded.range,
-      mark_text = excluded.mark_text,
-      style = excluded.style,
-      type = excluded.type,
+    UPDATE highlights
+    SET
+      chapter_uid = ?,
+      chapter_title = ?,
+      range = ?,
+      mark_text = ?,
+      style = ?,
+      type = ?,
       updated_at = CURRENT_TIMESTAMP
+    WHERE user_vid = ? AND bookmark_id = ?
   `);
-  // 确保所有值都不是 undefined，sql.js 不支持绑定 undefined
-  const values = [
-    userVid,
-    mark.bookmarkId || "",
-    bookId,
+  stmt.run([
     mark.chapterUid ?? 0,
     mark.chapterTitle || "",
     mark.range || "",
     mark.markText || "",
     mark.style ?? 0,
     mark.type ?? 1,
-    mark.createTime ?? Date.now() / 1000,
-    mark.updated ?? Date.now() / 1000,
-  ];
-
-  // 调试：检查是否有 undefined
-  const undefinedIndex = values.findIndex(v => v === undefined);
-  if (undefinedIndex !== -1) {
-    console.error("[upsertHighlight] 发现 undefined 值，索引:", undefinedIndex, "mark:", mark);
-    throw new Error(`SQL 绑定错误: 参数 ${undefinedIndex} 为 undefined`);
-  }
-
-  stmt.run(values);
+    userVid,
+    bookmarkId,
+  ]);
   stmt.free();
+
+  if (stats && db.getRowsModified() > 0) {
+    stats.highlightsUpdated = (stats.highlightsUpdated || 0) + 1;
+  }
 }
 
 /**
  * 删除划线数据
+ * @param stats 可选统计对象，用于精确记录删除数量
  */
-export function deleteHighlight(db: any, userVid: string, bookmarkId: string): void {
+export function deleteHighlight(
+  db: any,
+  userVid: string,
+  bookmarkId: string,
+  stats?: { highlightsRemoved?: number }
+): void {
   const stmt = db.prepare(
     "DELETE FROM highlights WHERE user_vid = ? AND bookmark_id = ?"
   );
   stmt.run([userVid || "", bookmarkId || ""]);
   stmt.free();
+
+  if (stats && db.getRowsModified() > 0) {
+    stats.highlightsRemoved = (stats.highlightsRemoved || 0) + 1;
+  }
 }
 
 /**
  * 更新划线的评论/想法
+ * @param stats 可选统计对象，用于精确记录合并想法数量
  */
 export function updateHighlightNote(
   db: any,
@@ -375,7 +436,8 @@ export function updateHighlightNote(
   bookId: string,
   chapterUid: number,
   range: string,
-  noteText: string
+  noteText: string,
+  stats?: { reviewsMerged?: number }
 ): void {
   console.log("[updateHighlightNote] 参数:", { userVid, bookId, chapterUid, range, noteText });
 
@@ -385,6 +447,22 @@ export function updateHighlightNote(
   if (chapterUid === undefined) console.error("[updateHighlightNote] chapterUid is undefined");
   if (range === undefined) console.error("[updateHighlightNote] range is undefined");
   if (noteText === undefined) console.error("[updateHighlightNote] noteText is undefined");
+
+  const existing = db.exec(
+    "SELECT note_text FROM highlights WHERE user_vid = ? AND book_id = ? AND chapter_uid = ? AND range = ?",
+    [userVid || "", bookId || "", chapterUid ?? 0, range ?? ""]
+  );
+
+  if (!existing.length || !existing[0].values.length) {
+    console.warn("[updateHighlightNote] 未找到对应 highlight，跳过:", { userVid, bookId, chapterUid, range });
+    return;
+  }
+
+  const currentNoteText = existing[0].values[0][0] || "";
+  if (currentNoteText === (noteText || "")) {
+    // 内容相同，跳过
+    return;
+  }
 
   const stmt = db.prepare(`
     UPDATE highlights
@@ -409,6 +487,10 @@ export function updateHighlightNote(
 
   stmt.run(values);
   stmt.free();
+
+  if (stats && db.getRowsModified() > 0) {
+    stats.reviewsMerged = (stats.reviewsMerged || 0) + 1;
+  }
 }
 
 /**
@@ -467,6 +549,7 @@ export function ensureUser(db: any, userVid: string, userName?: string): void {
 
 /**
  * 同步一本书的数据到数据库（包含完整的事务处理）
+ * @returns 精确增量统计对象 { highlightsAdded, highlightsUpdated, highlightsRemoved, reviewsMerged }
  */
 export function syncBookToDatabase(
   db: any,
@@ -514,7 +597,14 @@ export function syncBookToDatabase(
     startReadingTime?: number;
     finishTime?: number;
   }
-): void {
+): { highlightsAdded: number; highlightsUpdated: number; highlightsRemoved: number; reviewsMerged: number } {
+  const stats = {
+    highlightsAdded: 0,
+    highlightsUpdated: 0,
+    highlightsRemoved: 0,
+    reviewsMerged: 0,
+  };
+
   // 开始事务
   console.log("[syncBookToDatabase] 开始同步，userVid:", userVid, "bookId:", bookData.book?.bookId);
   db.run("BEGIN TRANSACTION");
@@ -558,7 +648,7 @@ export function syncBookToDatabase(
         style: mark.style,
         type: mark.type,
         createTime: mark.createTime,
-      });
+      }, stats);
     }
 
     // 5. 处理删除的划线数据
@@ -571,7 +661,7 @@ export function syncBookToDatabase(
           removed.chapterUid,
           removed.range
         );
-        deleteHighlight(db, userVid, bookmarkId);
+        deleteHighlight(db, userVid, bookmarkId, stats);
       }
     }
 
@@ -580,14 +670,19 @@ export function syncBookToDatabase(
     if (reviewData?.reviews) {
       for (const reviewItem of reviewData.reviews) {
         const review = reviewItem.review;
-        console.log("[syncBookToDatabase] 处理评论:", { chapterUid: review?.chapterUid, range: review?.range, content: review?.content?.substring(0, 50) });
+        if (!review || review.chapterUid == null || !review.range || review.content == null) {
+          console.warn("[syncBookToDatabase] 跳过不合法评论:", review);
+          continue;
+        }
+        console.log("[syncBookToDatabase] 处理评论:", { chapterUid: review.chapterUid, range: review.range, content: review.content.substring(0, 50) });
         updateHighlightNote(
           db,
           userVid,
           bookData.book.bookId,
           review.chapterUid,
           review.range,
-          review.content
+          review.content,
+          stats
         );
       }
     }
@@ -603,7 +698,8 @@ export function syncBookToDatabase(
     // 提交事务
     console.log("[syncBookToDatabase] 提交事务");
     db.run("COMMIT");
-    console.log("[syncBookToDatabase] 同步完成");
+    console.log("[syncBookToDatabase] 同步完成，stats:", stats);
+    return stats;
   } catch (error) {
     console.error("[syncBookToDatabase] 同步失败:", error);
     // 回滚事务
@@ -669,17 +765,29 @@ export function getAllBooks(db: any): any[] {
 }
 
 /**
+ * 获取 API 调用所需的 synckey
+ * 如果数据库中没有记录，返回 0
+ */
+export function getSyncKeyForApi(db: any, userVid: string, bookId: string): number {
+  if (!db) return 0;
+  try {
+    const state = getLastSyncState(db, userVid, bookId);
+    return state?.syncKey ?? 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/**
  * 获取用户的同步状态统计
  */
 export function getUserSyncStats(db: any, userVid: string): any {
   const result = db.exec(
     `SELECT
-      COUNT(DISTINCT book_id) as book_count,
-      COUNT(*) as highlight_count,
-      MAX(last_sync_at) as last_sync_at
-    FROM sync_state
-    WHERE user_vid = ?`,
-    [userVid]
+      (SELECT COUNT(DISTINCT book_id) FROM sync_state WHERE user_vid = ?) as book_count,
+      (SELECT COUNT(*) FROM highlights WHERE user_vid = ?) as highlight_count,
+      (SELECT MAX(last_sync_at) FROM sync_state WHERE user_vid = ?) as last_sync_at`,
+    [userVid, userVid, userVid]
   );
 
   if (result.length === 0 || result[0].values.length === 0) {

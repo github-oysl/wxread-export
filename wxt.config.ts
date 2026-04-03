@@ -34,7 +34,7 @@ export default defineConfig({
   manifest: {
     name: "微信读书导出",
     homepage_url: "https://github.com/scarqin/wxread-export",
-    permissions: ["storage"],
+    permissions: ["storage", "declarativeNetRequest", "cookies", "alarms", "notifications"],
     // 添加宽泛的 host_permissions，以支持用户配置的任意 S3 endpoint
     host_permissions: ["https://weread.qq.com/*", "https://*/*", "http://*/*"],
     // 添加 CSP 配置以支持 WebAssembly

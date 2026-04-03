@@ -3,6 +3,7 @@ import "wxt/browser";
 
 declare module "wxt/browser" {
   export type PublicPath =
+    | "/assets/sql-wasm.wasm"
     | "/background.js"
     | "/content-scripts/content.js"
     | "/icon/128.png"

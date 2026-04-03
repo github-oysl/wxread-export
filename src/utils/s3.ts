@@ -1,15 +1,13 @@
 /**
  * S3 上传模块
- * 使用 @aws-sdk/client-s3 v3 实现，兼容 S3Drive / MinIO / AWS S3 等
+ * 使用 aws4fetch 实现，兼容 S3Drive / MinIO / AWS S3 等
  *
- * 关键要求：必须设置 User-Agent: S3Drive/1.0
+ * 关键要求：
+ * 1. 必须设置 User-Agent: S3Drive/1.0（通过 background declarativeNetRequest 动态规则实现）
+ * 2. S3Drive 等第三方服务对 AWS SDK v2/v3 的签名/header 兼容性不佳，使用原生 fetch + aws4fetch 签名最稳定
  */
 
-import {
-  S3Client,
-  ListObjectsV2Command,
-  PutObjectCommand,
-} from "@aws-sdk/client-s3";
+import { AwsV4Signer } from "aws4fetch";
 
 // S3 配置存储 key
 const STORAGE_KEY_S3_CONFIG = "wereader_s3_config";
@@ -48,67 +46,91 @@ function normalizeEndpoint(raw: string): string {
 }
 
 /**
- * 创建 S3 客户端
- * 针对 S3Drive 等第三方 S3 兼容服务进行优化
+ * 通过 background service worker 更新 declarativeNetRequest 规则，
+ * 将发往该 S3 endpoint 的请求 User-Agent 强制设为 S3Drive/1.0
  */
-export function createS3Client(config: S3Config): S3Client {
-  const mergedConfig = { ...DEFAULT_S3_CONFIG, ...config };
+async function updateUARuleInBackground(endpoint: string): Promise<boolean> {
+  const normalized = normalizeEndpoint(endpoint);
 
-  // 确保 endpoint 规范（有协议头、无末尾斜杠）
-  const endpoint = normalizeEndpoint(mergedConfig.endpoint || "");
-
-  console.log("[S3] 创建客户端配置:", {
-    endpoint,
-    region: mergedConfig.region,
-    forcePathStyle: mergedConfig.forcePathStyle,
-  });
-
-  const client = new S3Client({
-    endpoint,
-    region: mergedConfig.region,
-    credentials: {
-      accessKeyId: mergedConfig.accessKeyId,
-      secretAccessKey: mergedConfig.secretAccessKey,
-    },
-    forcePathStyle: mergedConfig.forcePathStyle,
-    // 关键：模拟 S3Drive 客户端
-    customUserAgent: [["S3Drive", "1.0"]],
-    // 禁用校验和计算（某些 S3 兼容服务不支持）
-    requestChecksumCalculation: "WHEN_REQUIRED",
-    responseChecksumValidation: "WHEN_REQUIRED",
-  });
-
-  // 使用中间件强制设置 User-Agent（确保覆盖默认的 AWS SDK User-Agent）
-  // @ts-ignore - middleware 类型较复杂
-  client.middlewareStack.add(
-    (next: any, context: any) => async (args: any) => {
-      const { request } = args;
-      if (request) {
-        // 强制设置 User-Agent 为 S3Drive/1.0
-        request.headers["user-agent"] = "S3Drive/1.0";
-        // 移除 AWS SDK 默认的 x-amz-user-agent
-        delete request.headers["x-amz-user-agent"];
-
-        console.log("[S3] 发送请求:", {
-          method: request.method,
-          path: request.path,
-          host: request.hostname,
-          headers: {
-            ...Object.fromEntries(
-              Object.entries(request.headers).map(([k, v]) => [
-                k,
-                k === "authorization" ? "已设置(长度:" + String(v).length + ")" : v,
-              ])
-            ),
+  // 如果当前就在 background/service worker 上下文中（没有 window），直接本地更新规则
+  if (typeof window === "undefined" && typeof (chrome as any) !== "undefined" && (chrome as any).declarativeNetRequest) {
+    try {
+      const S3_UA_RULE_ID = 100;
+      const hostname = new URL(normalized).hostname;
+      await (chrome as any).declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [S3_UA_RULE_ID],
+        addRules: [
+          {
+            id: S3_UA_RULE_ID,
+            priority: 1,
+            action: {
+              type: (chrome as any).declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
+              requestHeaders: [
+                {
+                  header: "User-Agent",
+                  operation: (chrome as any).declarativeNetRequest.HeaderOperation.SET,
+                  value: "S3Drive/1.0",
+                },
+              ],
+            },
+            condition: {
+              urlFilter: `||${hostname}`,
+              resourceTypes: [
+                (chrome as any).declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
+              ],
+            },
           },
-        });
-      }
-      return next(args);
-    },
-    { step: "finalizeRequest", name: "s3driveUserAgent" }
-  );
+        ],
+      });
+      console.log("[S3] S3 UA 规则已更新（本地）:", hostname);
+      return true;
+    } catch (err) {
+      console.error("[S3] 本地更新 UA 规则失败:", err);
+      return false;
+    }
+  }
 
-  return client;
+  try {
+    if (typeof browser === "undefined" || !browser.runtime?.sendMessage) {
+      console.warn("[S3] browser.runtime.sendMessage 不可用，跳过 UA 规则更新");
+      return false;
+    }
+    const resp = await browser.runtime.sendMessage({
+      type: "UPDATE_S3_UA_RULE",
+      payload: { endpoint: normalized },
+    });
+    return resp?.success ?? false;
+  } catch (err) {
+    console.error("[S3] 更新 UA 规则失败:", err);
+    return false;
+  }
+}
+
+/**
+ * 对 S3 请求进行 AWS Signature V4 签名
+ */
+async function signedFetch(
+  url: string,
+  config: S3Config,
+  options: { method?: string; headers?: HeadersInit; body?: any } = {}
+): Promise<Response> {
+  const signer = new AwsV4Signer({
+    url,
+    method: options.method,
+    headers: options.headers,
+    body: options.body,
+    accessKeyId: config.accessKeyId,
+    secretAccessKey: config.secretAccessKey,
+    service: "s3",
+    region: config.region || DEFAULT_S3_CONFIG.region,
+  });
+
+  const signed = await signer.sign();
+  return fetch(signed.url, {
+    method: signed.method,
+    headers: signed.headers,
+    body: signed.body,
+  });
 }
 
 /**
@@ -119,62 +141,97 @@ export async function testS3Connection(
   config: S3Config
 ): Promise<{ success: boolean; message: string }> {
   try {
-    const s3 = createS3Client(config);
+    await updateUARuleInBackground(config.endpoint);
 
-    // 尝试列出桶中的对象（限制为1个）来验证连接
-    await s3.send(
-      new ListObjectsV2Command({
-        Bucket: config.bucket,
-        MaxKeys: 1,
-      })
-    );
+    const mergedConfig = { ...DEFAULT_S3_CONFIG, ...config };
+    const endpoint = normalizeEndpoint(mergedConfig.endpoint || "");
+    const url = `${endpoint}/${mergedConfig.bucket}?list-type=2&max-keys=1`;
 
-    return { success: true, message: "连接成功" };
-  } catch (error: any) {
-    // 增强错误日志
-    console.error("[S3] 连接测试失败，完整错误:", error);
-    console.error("[S3] 错误详情:", {
-      name: error?.name,
-      message: error?.message,
-      code: error?.$metadata?.httpStatusCode,
-      stack: error?.stack,
+    console.log("[S3] 测试连接:", url);
+
+    const resp = await signedFetch(url, mergedConfig, {
+      method: "GET",
     });
 
-    let message = "连接失败";
-    const errName = error?.name || "";
-    const errMsg = error?.message || "";
+    if (resp.ok) {
+      return { success: true, message: "连接成功" };
+    }
 
-    if (errName === "UnknownError" || errMsg.includes("UnknownError")) {
-      message = `连接测试失败: 服务端返回未知错误 (UnknownError)\n\n可能原因：\n1. S3Drive 需要特定的 User-Agent（已设置 S3Drive/1.0）\n2. Access Key 或 Secret Key 不正确\n3. 签名版本不匹配（当前使用 AWS Signature V4）\n\n建议检查 S3Drive 的密钥配置。`;
-    } else if (
-      errMsg.includes("Forbidden") ||
-      errMsg.includes("403") ||
-      errName === "Forbidden"
-    ) {
-      message = "访问被拒绝，请检查 Access Key 和 Secret Key";
-    } else if (
-      errMsg.includes("NoSuchBucket") ||
-      errMsg.includes("404") ||
-      errName === "NoSuchBucket"
-    ) {
-      message = "Bucket 不存在";
-    } else if (
-      errMsg.includes("SignatureDoesNotMatch") ||
-      errName === "SignatureDoesNotMatch"
-    ) {
+    const body = await resp.text();
+    console.error("[S3] 连接失败，状态:", resp.status, "响应:", body);
+
+    // 尝试解析 S3 XML 错误
+    const codeMatch = body.match(/<Code>([^<]+)<\/Code>/);
+    const messageMatch = body.match(/<Message>([^<]+)<\/Message>/);
+    const errCode = codeMatch?.[1] || "";
+    const errMsg = messageMatch?.[1] || body;
+
+    let message = "连接失败";
+    if (errCode === "SignatureDoesNotMatch" || errMsg.includes("SignatureDoesNotMatch")) {
       message = "签名不匹配，请检查 Secret Access Key 是否正确";
-    } else if (
-      errMsg.includes("Network") ||
-      errMsg.includes("ENOTFOUND") ||
-      errMsg.includes("fetch") ||
-      errName === "TypeError"
-    ) {
-      message = `网络错误或无法访问 Endpoint。\n可能原因：\n1. Endpoint 地址不正确（已自动补全为 ${normalizeEndpoint(config.endpoint || "")}）\n2. S3 服务端未开启 CORS\n3. 浏览器扩展权限不足，请确保已在扩展详情中授予"允许访问所有网站"权限`;
+    } else if (errCode === "InvalidAccessKeyId" || errMsg.includes("InvalidAccessKeyId")) {
+      message = "Access Key ID 无效，请检查是否正确";
+    } else if (errCode === "NoSuchBucket" || errMsg.includes("NoSuchBucket") || resp.status === 404) {
+      message = "Bucket 不存在";
+    } else if (errCode === "AccessDenied" || errMsg.includes("AccessDenied") || resp.status === 403) {
+      message = "访问被拒绝，请检查 Access Key 和 Secret Key";
     } else {
-      message = `错误${errName ? ` [${errName}]` : ""}: ${errMsg}`;
+      message = `连接失败 [HTTP ${resp.status}${errCode ? ` / ${errCode}` : ""}]: ${errMsg || "未知错误"}`;
     }
 
     return { success: false, message };
+  } catch (error: any) {
+    console.error("[S3] 连接测试异常:", error);
+
+    let message = "连接失败";
+    if (error?.message?.includes("ENOTFOUND") || error?.message?.includes("ECONNREFUSED") || error?.message?.includes("fetch")) {
+      message = `网络错误或无法访问 Endpoint。\n可能原因：\n1. Endpoint 地址不正确（已自动补全为 ${normalizeEndpoint(config.endpoint || "")}）\n2. S3 服务端未开启 CORS\n3. 浏览器扩展权限不足，请确保已在扩展详情中授予"允许访问所有网站"权限`;
+    } else {
+      message = `错误: ${error?.message || String(error)}`;
+    }
+
+    return { success: false, message };
+  }
+}
+
+/**
+ * 从 S3 下载 SQLite 数据库
+ * @param config S3 配置
+ * @returns 数据库数据 (Uint8Array) 或 null（表示文件不存在或下载失败）
+ */
+export async function downloadFromS3(config: S3Config): Promise<Uint8Array | null> {
+  try {
+    await updateUARuleInBackground(config.endpoint);
+
+    const mergedConfig = { ...DEFAULT_S3_CONFIG, ...config };
+    const endpoint = normalizeEndpoint(mergedConfig.endpoint || "");
+    const key = mergedConfig.key || DEFAULT_S3_CONFIG.key!;
+    const url = `${endpoint}/${mergedConfig.bucket}/${key}`;
+
+    console.log("[S3] 开始下载:", url);
+
+    const resp = await signedFetch(url, mergedConfig, {
+      method: "GET",
+    });
+
+    if (resp.status === 404) {
+      console.log("[S3] 远程数据库不存在，将创建新数据库");
+      return null;
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      console.error("[S3] 下载失败，状态:", resp.status, "响应:", body);
+      return null;
+    }
+
+    const arrayBuffer = await resp.arrayBuffer();
+    const data = new Uint8Array(arrayBuffer);
+    console.log("[S3] 下载成功，大小:", data.byteLength, "字节");
+    return data;
+  } catch (error: any) {
+    console.error("[S3] 下载异常:", error);
+    return null;
   }
 }
 
@@ -189,58 +246,61 @@ export async function uploadToS3(
   data: Uint8Array
 ): Promise<{ success: boolean; message: string; url?: string }> {
   try {
-    const s3 = createS3Client(config);
-    const key = config.key || DEFAULT_S3_CONFIG.key!;
+    await updateUARuleInBackground(config.endpoint);
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: config.bucket,
-        Key: key,
-        Body: data,
-        ContentType: "application/x-sqlite3",
-        CacheControl: "no-cache",
-      })
-    );
+    const mergedConfig = { ...DEFAULT_S3_CONFIG, ...config };
+    const endpoint = normalizeEndpoint(mergedConfig.endpoint || "");
+    const key = mergedConfig.key || DEFAULT_S3_CONFIG.key!;
+    const url = `${endpoint}/${mergedConfig.bucket}/${key}`;
 
-    // 构建文件 URL
-    const fileUrl = buildS3Url(config, key);
+    console.log("[S3] 开始上传:", url, "大小:", data.byteLength, "字节");
 
-    return {
-      success: true,
-      message: `成功上传到 ${config.bucket}/${key}`,
-      url: fileUrl,
-    };
-  } catch (error: any) {
-    // 增强错误日志，打印完整的错误对象以便诊断
-    console.error("[S3] 上传失败，完整错误:", error);
-    console.error("[S3] 错误详情:", {
-      name: error?.name,
-      message: error?.message,
-      code: error?.$metadata?.httpStatusCode,
-      requestId: error?.$metadata?.requestId,
-      cfId: error?.$metadata?.cfId,
-      extendedRequestId: error?.$metadata?.extendedRequestId,
-      stack: error?.stack,
+    const resp = await signedFetch(url, mergedConfig, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/x-sqlite3",
+        "Cache-Control": "no-cache",
+      },
+      body: data,
     });
 
-    let message = "上传失败";
-    if (error instanceof Error || error?.message) {
-      const errName = error.name || "";
-      const errMsg = error.message || "";
+    if (resp.ok) {
+      const fileUrl = buildS3Url(config, key);
+      return {
+        success: true,
+        message: `成功上传到 ${config.bucket}/${key}`,
+        url: fileUrl,
+      };
+    }
 
-      if (errName === "UnknownError" || errMsg.includes("UnknownError")) {
-        message = `上传失败: 服务端返回未知错误 (UnknownError)\n\n可能原因：\n1. S3Drive 服务端需要特定的 User-Agent（已设置 S3Drive/1.0）\n2. Access Key 或 Secret Key 不正确\n3. 签名版本不匹配（当前使用 AWS Signature V4）\n4. 服务端返回了非标准的 HTTP 响应\n\n建议：\n- 确认 S3Drive 的 Access Key 和 Secret Key 正确\n- 检查 S3Drive 的日志查看具体拒绝原因\n- 尝试在 S3Drive 管理界面检查是否有访问限制`;
-      } else if (errMsg.includes("fetch") || errMsg.includes("Network") || errName === "TypeError") {
-        message = `上传失败：网络错误或无法访问 Endpoint。\n请检查扩展是否拥有对应域名的访问权限，或 S3 服务端是否开启 CORS。`;
-      } else if (errName === "SignatureDoesNotMatch" || errMsg.includes("SignatureDoesNotMatch")) {
-        message = `上传失败: 签名不匹配 (SignatureDoesNotMatch)\n请检查 Secret Access Key 是否正确。`;
-      } else if (errName === "InvalidAccessKeyId" || errMsg.includes("InvalidAccessKeyId")) {
-        message = `上传失败: Access Key ID 无效\n请检查 Access Key ID 是否正确。`;
-      } else if (errName === "Forbidden" || errMsg.includes("Forbidden") || errMsg.includes("403")) {
-        message = `上传失败: 访问被拒绝 (Forbidden)\n请检查密钥是否有写入权限。`;
-      } else {
-        message = `上传失败: ${errName ? `[${errName}] ` : ""}${errMsg}`;
-      }
+    const body = await resp.text();
+    console.error("[S3] 上传失败，状态:", resp.status, "响应:", body);
+
+    const codeMatch = body.match(/<Code>([^<]+)<\/Code>/);
+    const messageMatch = body.match(/<Message>([^<]+)<\/Message>/);
+    const errCode = codeMatch?.[1] || "";
+    const errMsg = messageMatch?.[1] || body;
+
+    let message = "上传失败";
+    if (errCode === "SignatureDoesNotMatch" || errMsg.includes("SignatureDoesNotMatch")) {
+      message = "签名不匹配，请检查 Secret Access Key 是否正确";
+    } else if (errCode === "InvalidAccessKeyId" || errMsg.includes("InvalidAccessKeyId")) {
+      message = "Access Key ID 无效，请检查是否正确";
+    } else if (errCode === "AccessDenied" || errMsg.includes("AccessDenied") || resp.status === 403) {
+      message = "访问被拒绝，请检查密钥是否有写入权限";
+    } else {
+      message = `上传失败 [HTTP ${resp.status}${errCode ? ` / ${errCode}` : ""}]: ${errMsg || "未知错误"}`;
+    }
+
+    return { success: false, message };
+  } catch (error: any) {
+    console.error("[S3] 上传异常:", error);
+
+    let message = "上传失败";
+    if (error?.message?.includes("Network") || error?.message?.includes("fetch")) {
+      message = "上传失败：网络错误或无法访问 Endpoint。请检查扩展权限或 S3 服务端 CORS 配置。";
+    } else {
+      message = `上传失败: ${error?.message || String(error)}`;
     }
 
     return { success: false, message };
@@ -254,10 +314,8 @@ function buildS3Url(config: S3Config, key: string): string {
   const endpoint = normalizeEndpoint(config.endpoint || "");
 
   if (config.forcePathStyle) {
-    // 路径样式: https://s3.example.com/bucket-name/key
     return `${endpoint}/${config.bucket}/${key}`;
   } else {
-    // 虚拟主机样式: https://bucket-name.s3.example.com/key
     if (endpoint.includes("amazonaws.com")) {
       return `${endpoint}/${key}`;
     }
@@ -278,20 +336,17 @@ function getStorage() {
 
 /**
  * 保存 S3 配置到 storage
+ * 保存成功后通知 background 更新 declarativeNetRequest UA 规则
  * @param config S3 配置（不包含 secretAccessKey 时保留原有值）
  */
 export async function saveS3Config(config: Partial<S3Config>): Promise<void> {
   const storage = getStorage();
-
-  // 获取现有配置（如果有）
   const existing = await getS3Config();
 
-  // 合并配置
   const merged = {
     ...DEFAULT_S3_CONFIG,
     ...existing,
     ...config,
-    // 如果没有提供新的 secretAccessKey，保留现有的
     secretAccessKey:
       config.secretAccessKey || existing?.secretAccessKey || "",
   } as S3Config;
@@ -299,6 +354,10 @@ export async function saveS3Config(config: Partial<S3Config>): Promise<void> {
   await storage.set({
     [STORAGE_KEY_S3_CONFIG]: merged,
   });
+
+  if (merged.endpoint) {
+    await updateUARuleInBackground(merged.endpoint);
+  }
 
   console.log("[S3] 配置已保存");
 }
@@ -354,15 +413,13 @@ export async function exportToS3(
   db: any,
   bookTitle: string
 ): Promise<{ success: boolean; message: string; url?: string }> {
-  // 检查是否已配置 S3
   const isConfigured = await isS3Configured();
   console.log("[S3] 检查配置状态:", { isConfigured });
 
   if (!isConfigured) {
     return {
       success: false,
-      message:
-        "S3 未配置，请先配置 S3 参数\n\n配置路径: 扩展设置 > S3 配置",
+      message: "S3 未配置，请先配置 S3 参数\n\n配置路径: 扩展设置 > S3 配置",
     };
   }
 
@@ -381,11 +438,9 @@ export async function exportToS3(
   }
 
   try {
-    // 导出数据库数据
     const data: Uint8Array = db.export();
     console.log("[S3] 数据库导出大小:", data.byteLength, "字节");
 
-    // 上传到 S3
     console.log("[S3] 开始上传...");
     const result = await uploadToS3(config, data);
     console.log("[S3] 上传结果:", result);

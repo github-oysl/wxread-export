@@ -9,6 +9,8 @@
   export let visible = false;
   export let onClose = () => {};
 
+  const AUTO_SYNC_STORAGE_KEY = "wereader_auto_sync_config";
+
   let config = {
     endpoint: "",
     bucket: "",
@@ -17,6 +19,11 @@
     region: "us-east-1",
     key: "wereader_notes.db",
     forcePathStyle: true,
+  };
+
+  let autoSyncConfig = {
+    enabled: false,
+    intervalHours: 24,
   };
 
   let message = "";
@@ -38,7 +45,22 @@
         };
       }
     } catch (e) {
-      console.error("[Settings] 加载配置失败:", e);
+      console.error("[Settings] 加载 S3 配置失败:", e);
+    }
+
+    try {
+      if (typeof browser !== "undefined" && browser.storage) {
+        const res = await browser.storage.local.get(AUTO_SYNC_STORAGE_KEY);
+        const saved = res[AUTO_SYNC_STORAGE_KEY];
+        if (saved) {
+          autoSyncConfig = {
+            enabled: !!saved.enabled,
+            intervalHours: saved.intervalHours || 24,
+          };
+        }
+      }
+    } catch (e) {
+      console.error("[Settings] 加载自动同步配置失败:", e);
     }
   }
 
@@ -74,6 +96,22 @@
 
     try {
       await saveS3Config(config);
+
+      // 保存自动同步配置
+      if (typeof browser !== "undefined" && browser.storage) {
+        await browser.storage.local.set({
+          [AUTO_SYNC_STORAGE_KEY]: autoSyncConfig,
+        });
+      }
+
+      // 通知 background 设置/清除 alarm
+      if (typeof browser !== "undefined" && browser.runtime?.sendMessage) {
+        await browser.runtime.sendMessage({
+          type: "SET_AUTO_SYNC",
+          payload: autoSyncConfig,
+        });
+      }
+
       showMessage("配置已保存！正在关闭...", "success");
       // 保存成功后延迟 800ms 自动关闭弹窗，给用户明确的反馈
       setTimeout(() => {
@@ -274,6 +312,39 @@
           <span class="help-text">（MinIO 等私有 S3 通常需要）</span>
         </label>
 
+        <div class="autosync-section">
+          <label class="mdui-checkbox">
+            <input
+              type="checkbox"
+              bind:checked={autoSyncConfig.enabled}
+              disabled={testLoading || saveLoading}
+            />
+            <i class="mdui-checkbox-icon"></i>
+            启用定时自动同步到 S3
+          </label>
+
+          {#if autoSyncConfig.enabled}
+            <div class="mdui-textfield" style="margin-top: 8px;">
+              <label class="mdui-textfield-label">
+                自动同步间隔
+                <span class="help-text">（到达间隔后自动在后台执行全量同步）</span>
+              </label>
+              <select
+                class="mdui-textfield-input"
+                bind:value={autoSyncConfig.intervalHours}
+                disabled={testLoading || saveLoading}
+              >
+                <option value={1 / 60}>每 1 分钟（测试用）</option>
+                <option value={1}>每 1 小时</option>
+                <option value={3}>每 3 小时</option>
+                <option value={6}>每 6 小时</option>
+                <option value={12}>每 12 小时</option>
+                <option value={24}>每 24 小时</option>
+              </select>
+            </div>
+          {/if}
+        </div>
+
         <div class="help-section">
           <div class="help-title">支持的服务:</div>
           <ul class="help-list">
@@ -464,6 +535,13 @@
     font-size: 12px;
     color: rgba(0, 0, 0, 0.38);
     margin-left: 4px;
+  }
+
+  .autosync-section {
+    margin-top: 16px;
+    padding: 12px;
+    background: #f0f4ff;
+    border-radius: 4px;
   }
 
   .help-section {
