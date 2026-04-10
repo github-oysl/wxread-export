@@ -144,7 +144,27 @@ export async function syncAllBooksToDatabase(): Promise<{
     effectiveUserVid = "unknown_user";
   }
 
-  // 7. 遍历所有书籍，逐本同步并统计精确增量
+  // 7. 并行获取所有书籍数据（提高速度）
+  console.log(`[Sync] 开始并行获取 ${books.length} 本书的数据...`);
+  const startTime = Date.now();
+
+  // 先并行获取所有书籍数据（HTTP请求可以并行）
+  const bookDataPromises = books.map(async (book, index) => {
+    try {
+      console.log(`[Sync] 获取第 ${index + 1}/${books.length} 本书数据:`, book.title);
+      const data = await fetchBookData(book, effectiveUserVid, db);
+      return { book, data, success: true, index };
+    } catch (e) {
+      console.error(`[Sync] 获取书籍数据失败 ${book.title}:`, e);
+      return { book, data: null, success: false, index, error: e };
+    }
+  });
+
+  const bookDataResults = await Promise.all(bookDataPromises);
+  const fetchTime = Date.now() - startTime;
+  console.log(`[Sync] 数据获取完成，耗时: ${fetchTime}ms`);
+
+  // 8. 串行写入数据库（避免并发写入冲突）
   let successCount = 0;
   let failCount = 0;
   let changedBooks = 0;
@@ -153,15 +173,14 @@ export async function syncAllBooksToDatabase(): Promise<{
   let totalRemoved = 0;
   let totalReviews = 0;
 
-  for (let i = 0; i < books.length; i++) {
-    const book = books[i];
+  for (const result of bookDataResults) {
+    if (!result.success) {
+      failCount++;
+      continue;
+    }
+
     try {
-      console.log(`[Sync] 同步第 ${i + 1}/${books.length} 本书:`, book.title);
-      const { bookData, reviewData, progressInfo } = await fetchBookData(
-        book,
-        effectiveUserVid,
-        db
-      );
+      const { bookData, reviewData, progressInfo } = result.data;
       const bookStats = await dbModule.syncBookToDatabase(
         db,
         effectiveUserVid,
@@ -186,10 +205,13 @@ export async function syncAllBooksToDatabase(): Promise<{
         changedBooks++;
       }
     } catch (e) {
-      console.error(`[Sync] 同步书籍失败 ${book.title}:`, e);
+      console.error(`[Sync] 同步书籍失败 ${result.book.title}:`, e);
       failCount++;
     }
   }
+
+  const totalTime = Date.now() - startTime;
+  console.log(`[Sync] 同步完成，总耗时: ${totalTime}ms`);
 
   // 8. （可选）上传到 S3 - 现在数据已直接保存到 PostgreSQL，S3 备份可选
   // const result = await exportToS3(s3Db, "全部笔记");

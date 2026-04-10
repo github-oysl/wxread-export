@@ -74,6 +74,11 @@
         let message = "导出到数据库成功！";
 
         if (s) {
+          message += `\n\n处理书籍：${s.successCount} 本成功`;
+          if (s.failCount > 0) {
+            message += `，${s.failCount} 本失败`;
+          }
+
           const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
           if (hasChanges) {
             const details = [];
@@ -81,15 +86,12 @@
             if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
             if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
             if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
-            message += `\n\n本次变更：涉及 ${s.changedBooks} 本书`;
+            message += `\n有变更的书籍：${s.changedBooks} 本`;
             if (details.length > 0) message += `\n${details.join("，")}`;
           } else {
             message += "\n\n本次无新增变更，所有笔记已是最新。";
           }
           message += `\n\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
-          if (s.failCount > 0) {
-            message += `\n\n注意：${s.failCount} 本书导出失败。`;
-          }
         }
         alert(message);
       } else {
