@@ -1,6 +1,5 @@
 <script>
   import { getSyncKeyForApi } from "../../utils/file";
-  import { isS3Configured } from "../../utils/s3";
   import { syncAllBooksToDatabase, fetchBookData, getWrVidFromCookie } from "../../utils/sync";
   import Settings from "./Settings.svelte";
 
@@ -11,15 +10,6 @@
   let errorMessage = "";
   let showError = false;
   let showSettings = false;
-  let s3Configured = false;
-
-  // 检查 S3 是否已配置（保留用于设置按钮显示）
-  async function checkS3Config() {
-    s3Configured = await isS3Configured();
-  }
-
-  // 页面加载时检查 S3 配置
-  checkS3Config();
 
   async function getNoteBooks() {
     // 优先从 cookie 读取 wr_vid
@@ -132,7 +122,7 @@
   <button
     class="mdui-btn mdui-btn-icon"
     on:click={() => (showSettings = true)}
-    title="S3 存储设置"
+    title="数据库与导出设置"
   >
     <i class="mdui-icon material-icons">settings</i>
   </button>
@@ -148,8 +138,6 @@
 
 <Settings bind:visible={showSettings} onClose={() => {
   showSettings = false;
-  // 重新检查 S3 配置（用户可能已修改）
-  checkS3Config();
 }} />
 <div class=" mdui-container book-list-wrap">
   {#each books as book (book.bookId)}

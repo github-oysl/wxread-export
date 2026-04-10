@@ -34,19 +34,9 @@ export default defineConfig({
   manifest: {
     name: "微信读书导出",
     homepage_url: "https://github.com/scarqin/wxread-export",
-    permissions: ["storage", "declarativeNetRequest", "cookies", "alarms", "notifications"],
-    // 添加宽泛的 host_permissions，以支持用户配置的任意 S3 endpoint
+    permissions: ["storage", "cookies", "alarms", "notifications"],
+    // 添加宽泛的 host_permissions，以支持用户配置的任意 S3 endpoint 和 PostgREST
     host_permissions: ["https://weread.qq.com/*", "https://*/*", "http://*/*"],
-    // 添加 CSP 配置以支持 WebAssembly
-    content_security_policy: {
-      extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-    },
-    web_accessible_resources: [
-      {
-        resources: ["assets/sql-wasm.wasm", "assets/sql-wasm-*.wasm"],
-        matches: ["<all_urls>"],
-      },
-    ],
   },
   vite: (env) => ({
     // 使用相对路径，避免扩展中绝对路径问题
@@ -62,8 +52,5 @@ export default defineConfig({
         preprocess: [vitePreprocess()],
       }),
     ],
-    optimizeDeps: {
-      exclude: ["sql.js"],
-    },
   }),
 });

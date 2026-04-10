@@ -24,11 +24,5 @@
     "typescript": "^5.3.3",
     "wxt": "^0.17.0"
   },
-  "dependencies": {
-    "@aws-sdk/client-s3": "^3.1023.0",
-    "aws-sdk": "^2.1692.0",
-    "aws4fetch": "^1.0.20",
-    "minio": "^8.0.7",
-    "sql.js": "^1.14.1"
-  }
+  "dependencies": {}
 }

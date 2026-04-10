@@ -3,70 +3,14 @@
  * MV3 service worker 版本
  */
 
-import { syncAllBooksToS3 } from "../utils/sync";
+import { syncAllBooksToDatabase } from "../utils/sync";
 
 // 由于项目中未安装 @types/chrome，在此处做最小声明
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const chrome: any;
 
-// S3 User-Agent 动态规则 ID
-const S3_UA_RULE_ID = 100;
 const AUTO_SYNC_STORAGE_KEY = "wereader_auto_sync_config";
-const AUTO_SYNC_ALARM_NAME = "AUTO_SYNC_S3";
-
-/**
- * 更新 declarativeNetRequest 动态规则
- * 将发往指定 S3 endpoint 的 xmlhttprequest 请求 User-Agent 设为 S3Drive/1.0
- */
-async function updateS3UARule(endpoint: string): Promise<boolean> {
-  try {
-    const hostname = new URL(endpoint).hostname;
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [S3_UA_RULE_ID],
-      addRules: [
-        {
-          id: S3_UA_RULE_ID,
-          priority: 1,
-          action: {
-            type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
-            requestHeaders: [
-              {
-                header: "User-Agent",
-                operation: chrome.declarativeNetRequest.HeaderOperation.SET,
-                value: "S3Drive/1.0",
-              },
-            ],
-          },
-          condition: {
-            urlFilter: `||${hostname}`,
-            resourceTypes: [
-              chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
-            ],
-          },
-        },
-      ],
-    });
-    console.log("[Background] S3 UA 规则已更新:", hostname);
-    return true;
-  } catch (error) {
-    console.error("[Background] 更新 S3 UA 规则失败:", error);
-    return false;
-  }
-}
-
-/**
- * 清理 S3 UA 动态规则
- */
-async function clearS3UARule(): Promise<void> {
-  try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [S3_UA_RULE_ID],
-    });
-    console.log("[Background] S3 UA 规则已清除");
-  } catch (error) {
-    // 忽略清除错误
-  }
-}
+const AUTO_SYNC_ALARM_NAME = "AUTO_SYNC_DB";
 
 // 简单的内存存储（service worker 生命周期内有效）
 let savedFileName: string | null = null;
@@ -121,9 +65,6 @@ function notifySyncResult(title: string, message: string): void {
 export default defineBackground(() => {
   console.log("[Background] 微信读书导出扩展后台脚本已启动");
 
-  // 启动时清理旧的 S3 UA 规则
-  clearS3UARule();
-
   // 恢复自动同步 alarm
   restoreAutoSyncAlarm();
 
@@ -162,16 +103,6 @@ export default defineBackground(() => {
               savedFileName = null;
               console.log("[Background] 文件名已清除");
               sendResponse({ success: true });
-              break;
-
-            // 更新 S3 User-Agent 规则
-            case "UPDATE_S3_UA_RULE":
-              if (payload?.endpoint) {
-                const ok = await updateS3UARule(payload.endpoint);
-                sendResponse({ success: ok });
-              } else {
-                sendResponse({ success: false, error: "缺少 endpoint" });
-              }
               break;
 
             // 设置/清除自动同步 alarm
@@ -219,21 +150,10 @@ export default defineBackground(() => {
     chrome.alarms.onAlarm.addListener(async (alarm: any) => {
       if (alarm.name !== AUTO_SYNC_ALARM_NAME) return;
 
-      console.log("[Background] 自动同步 alarm 触发，开始执行 S3 同步");
-
-      // 提前刷新 S3 UA 规则，避免 syncAllBooksToS3 内部的 sendMessage 在 SW 中偶发失败
-      try {
-        const s3Res = await chrome.storage.local.get("wereader_s3_config");
-        const s3Config = s3Res["wereader_s3_config"];
-        if (s3Config?.endpoint) {
-          await updateS3UARule(s3Config.endpoint);
-        }
-      } catch (e) {
-        console.warn("[Background] 自动同步前更新 UA 规则失败:", e);
-      }
+      console.log("[Background] 自动同步 alarm 触发，开始执行数据库同步");
 
       try {
-        const result = await syncAllBooksToS3();
+        const result = await syncAllBooksToDatabase();
         if (result.success) {
           const s = result.stats;
           let message = "";

@@ -118,7 +118,7 @@ export async function syncAllBooksToDatabase(): Promise<{
   const dbModule = await import("./db");
 
   // 4. 创建数据库连接（PostgREST 模式）
-  const db = dbModule.createDatabase();
+  const db = await dbModule.createDatabase();
   console.log("[Sync] 已连接到 PostgREST 数据库");
 
   // 5. 获取 effectiveUserVid
@@ -180,6 +180,10 @@ export async function syncAllBooksToDatabase(): Promise<{
     }
 
     try {
+      if (!result.data) {
+        failCount++;
+        continue;
+      }
       const { bookData, reviewData, progressInfo } = result.data;
       const bookStats = await dbModule.syncBookToDatabase(
         db,

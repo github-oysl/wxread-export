@@ -3,8 +3,39 @@
  * 替代原有的 SQLite/sql.js 实现
  */
 
-// PostgREST API 基础配置
-const POSTGREST_URL = "http://43.139.41.82:3000";
+const DEFAULT_POSTGREST_URL = "http://43.139.41.82:3000";
+
+// 模块级缓存，减少频繁读取 storage
+let cachedPostgrestUrl: string | null = null;
+
+/**
+ * 从扩展存储中获取 PostgREST URL，未配置时返回默认值
+ */
+export async function getPostgrestUrl(): Promise<string> {
+  if (cachedPostgrestUrl) {
+    return cachedPostgrestUrl;
+  }
+  try {
+    if (typeof browser !== "undefined" && browser.storage) {
+      const res = await browser.storage.local.get("wereader_postgrest_config");
+      const config = res["wereader_postgrest_config"];
+      cachedPostgrestUrl = config?.postgrestUrl?.trim() || DEFAULT_POSTGREST_URL;
+    } else {
+      cachedPostgrestUrl = DEFAULT_POSTGREST_URL;
+    }
+  } catch (e) {
+    console.error("[db] 读取 PostgREST URL 失败:", e);
+    cachedPostgrestUrl = DEFAULT_POSTGREST_URL;
+  }
+  return cachedPostgrestUrl || DEFAULT_POSTGREST_URL;
+}
+
+/**
+ * 清除 PostgREST URL 缓存
+ */
+export function invalidatePostgrestUrlCache(): void {
+  cachedPostgrestUrl = null;
+}
 
 /**
  * 获取 API 请求的基础配置
@@ -30,7 +61,8 @@ async function request(
     headers["Prefer"] = prefer;
   }
 
-  const response = await fetch(`${POSTGREST_URL}${endpoint}`, {
+  const postgrestUrl = await getPostgrestUrl();
+  const response = await fetch(`${postgrestUrl}${endpoint}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -55,17 +87,18 @@ async function request(
  */
 export async function initSqlite(): Promise<void> {
   try {
-    const response = await fetch(POSTGREST_URL);
+    const postgrestUrl = await getPostgrestUrl();
+    const response = await fetch(postgrestUrl);
     if (!response.ok) {
       throw new Error(`PostgREST 服务不可用: ${response.status}`);
     }
-    console.log("[PostgREST] 连接成功");
+    console.log("[PostgREST] 连接成功:", postgrestUrl);
   } catch (error) {
     console.error("[PostgREST] 连接失败:", error);
     throw new Error(
       "无法连接到 PostgREST 服务。\n" +
       "请检查:\n" +
-      "1. PostgREST 服务是否已启动 (http://43.139.41.82:3000)\n" +
+      "1. PostgREST 服务是否已启动 (默认: http://43.139.41.82:3000)\n" +
       "2. 网络连接是否正常"
     );
   }
@@ -75,9 +108,10 @@ export async function initSqlite(): Promise<void> {
  * 创建新数据库连接
  * 在 PostgREST 模式下不需要创建数据库，返回一个虚拟对象用于兼容
  */
-export function createDatabase(): any {
+export async function createDatabase(): Promise<any> {
   // 返回一个虚拟对象，表示使用 PostgREST
-  return { type: "postgrest", url: POSTGREST_URL };
+  const postgrestUrl = await getPostgrestUrl();
+  return { type: "postgrest", url: postgrestUrl };
 }
 
 /**
@@ -672,9 +706,10 @@ export async function getUserSyncStats(db: any, userVid: string): Promise<any> {
  */
 async function getTableCount(table: string, userVid: string): Promise<number> {
   try {
+    const postgrestUrl = await getPostgrestUrl();
     // 方法1: 使用 Range 头获取总数
     const response = await fetch(
-      `${POSTGREST_URL}/${table}?user_vid=eq.${encodeURIComponent(userVid)}`,
+      `${postgrestUrl}/${table}?user_vid=eq.${encodeURIComponent(userVid)}`,
       {
         method: "HEAD",
         headers: {

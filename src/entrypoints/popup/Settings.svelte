@@ -1,24 +1,14 @@
 <script>
-  import {
-    getS3Config,
-    saveS3Config,
-    clearS3Config,
-    testS3Connection,
-  } from "../../utils/s3";
-
   export let visible = false;
   export let onClose = () => {};
 
   const AUTO_SYNC_STORAGE_KEY = "wereader_auto_sync_config";
+  const POSTGREST_CONFIG_KEY = "wereader_postgrest_config";
+  const EXPORT_CONFIG_KEY = "wereader_export_config";
 
   let config = {
-    endpoint: "",
-    bucket: "",
-    accessKeyId: "",
-    secretAccessKey: "",
-    region: "us-east-1",
-    key: "wereader_notes.db",
-    forcePathStyle: true,
+    postgrestUrl: "",
+    exportDir: "",
   };
 
   let autoSyncConfig = {
@@ -28,39 +18,36 @@
 
   let message = "";
   let messageType = ""; // 'success' | 'error' | 'info'
-  let showSecretKey = false;
-
-  // 分离测试和保存的 loading 状态，避免互相干扰
-  let testLoading = false;
   let saveLoading = false;
 
   // 加载已有配置
   async function loadConfig() {
     try {
-      const savedConfig = await getS3Config();
-      if (savedConfig) {
-        config = {
-          ...config,
-          ...savedConfig,
-        };
-      }
-    } catch (e) {
-      console.error("[Settings] 加载 S3 配置失败:", e);
-    }
-
-    try {
       if (typeof browser !== "undefined" && browser.storage) {
-        const res = await browser.storage.local.get(AUTO_SYNC_STORAGE_KEY);
-        const saved = res[AUTO_SYNC_STORAGE_KEY];
-        if (saved) {
+        const res = await browser.storage.local.get([
+          POSTGREST_CONFIG_KEY,
+          EXPORT_CONFIG_KEY,
+          AUTO_SYNC_STORAGE_KEY,
+        ]);
+        const pgConfig = res[POSTGREST_CONFIG_KEY];
+        const exportConfig = res[EXPORT_CONFIG_KEY];
+        const autoSync = res[AUTO_SYNC_STORAGE_KEY];
+
+        if (pgConfig) {
+          config.postgrestUrl = pgConfig.postgrestUrl || "";
+        }
+        if (exportConfig) {
+          config.exportDir = exportConfig.exportDir || "";
+        }
+        if (autoSync) {
           autoSyncConfig = {
-            enabled: !!saved.enabled,
-            intervalHours: saved.intervalHours || 24,
+            enabled: !!autoSync.enabled,
+            intervalHours: autoSync.intervalHours || 24,
           };
         }
       }
     } catch (e) {
-      console.error("[Settings] 加载自动同步配置失败:", e);
+      console.error("[Settings] 加载配置失败:", e);
     }
   }
 
@@ -75,34 +62,26 @@
     messageType = type;
   }
 
-  async function handleTest() {
-    testLoading = true;
-    message = "";
-
-    const result = await testS3Connection(config);
-
-    testLoading = false;
-    showMessage(result.message, result.success ? "success" : "error");
-  }
-
   async function handleSave() {
-    if (!config.endpoint || !config.bucket || !config.accessKeyId) {
-      showMessage("请填写所有必填项", "error");
-      return;
-    }
-
     saveLoading = true;
     message = "";
 
     try {
-      await saveS3Config(config);
-
-      // 保存自动同步配置
       if (typeof browser !== "undefined" && browser.storage) {
         await browser.storage.local.set({
+          [POSTGREST_CONFIG_KEY]: {
+            postgrestUrl: config.postgrestUrl.trim(),
+          },
+          [EXPORT_CONFIG_KEY]: {
+            exportDir: config.exportDir.trim(),
+          },
           [AUTO_SYNC_STORAGE_KEY]: autoSyncConfig,
         });
       }
+
+      // 清除 URL 缓存，使新配置立即生效
+      const { invalidatePostgrestUrlCache } = await import("../../utils/db");
+      invalidatePostgrestUrlCache();
 
       // 通知 background 设置/清除 alarm
       if (typeof browser !== "undefined" && browser.runtime?.sendMessage) {
@@ -113,39 +92,12 @@
       }
 
       showMessage("配置已保存！正在关闭...", "success");
-      // 保存成功后延迟 800ms 自动关闭弹窗，给用户明确的反馈
       setTimeout(() => {
         handleClose();
       }, 800);
     } catch (e) {
       console.error("[Settings] 保存失败:", e);
-      showMessage("保存失败: " + e.message, "error");
-    } finally {
-      saveLoading = false;
-    }
-  }
-
-  async function handleClear() {
-    if (!confirm("确定要清除 S3 配置吗？")) {
-      return;
-    }
-
-    saveLoading = true;
-    try {
-      await clearS3Config();
-      config = {
-        endpoint: "",
-        bucket: "",
-        accessKeyId: "",
-        secretAccessKey: "",
-        region: "us-east-1",
-        key: "wereader_notes.db",
-        forcePathStyle: true,
-      };
-      showMessage("配置已清除", "info");
-    } catch (e) {
-      console.error("[Settings] 清除失败:", e);
-      showMessage("清除失败: " + e.message, "error");
+      showMessage("保存失败: " + (e.message || String(e)), "error");
     } finally {
       saveLoading = false;
     }
@@ -176,11 +128,11 @@
     <!-- svelte-ignore a11y-no-static-element-interactions -->
     <div class="settings-dialog mdui-card" on:click={stopPropagation}>
       <div class="mdui-card-header">
-        <div class="mdui-card-header-title">S3 存储配置</div>
+        <div class="mdui-card-header-title">数据库与导出设置</div>
         <button
           class="mdui-btn mdui-btn-icon"
           on:click={handleClose}
-          disabled={testLoading || saveLoading}
+          disabled={saveLoading}
         >
           <i class="mdui-icon material-icons">close</i>
         </button>
@@ -199,140 +151,60 @@
           </div>
         {/if}
 
+        <div class="section-title">PostgREST 数据库</div>
         <div class="mdui-textfield">
-          <label class="mdui-textfield-label">
-            Endpoint *
-            <span class="help-text">（例如: https://s3.amazonaws.com）</span>
+          <label class="mdui-textfield-label" for="postgrest-url">
+            PostgREST URL
+            <span class="help-text">（留空使用默认值）</span>
           </label>
           <input
+            id="postgrest-url"
             class="mdui-textfield-input"
             type="text"
-            bind:value={config.endpoint}
-            placeholder="https://s3.example.com"
-            disabled={testLoading || saveLoading}
+            bind:value={config.postgrestUrl}
+            placeholder="http://43.139.41.82:3000"
+            disabled={saveLoading}
           />
         </div>
 
+        <div class="section-title">本地导出配置</div>
         <div class="mdui-textfield">
-          <label class="mdui-textfield-label">Bucket *</label>
-          <input
-            class="mdui-textfield-input"
-            type="text"
-            bind:value={config.bucket}
-            placeholder="my-bucket"
-            disabled={testLoading || saveLoading}
-          />
-        </div>
-
-        <div class="mdui-textfield">
-          <label class="mdui-textfield-label">Access Key ID *</label>
-          <input
-            class="mdui-textfield-input"
-            type="text"
-            bind:value={config.accessKeyId}
-            placeholder="AKIA..."
-            disabled={testLoading || saveLoading}
-          />
-        </div>
-
-        <div class="mdui-textfield">
-          <label class="mdui-textfield-label">Secret Access Key</label>
-          <div class="secret-input-wrapper">
-            {#if showSecretKey}
-              <input
-                class="mdui-textfield-input"
-                type="text"
-                bind:value={config.secretAccessKey}
-                placeholder="留空表示不修改"
-                disabled={testLoading || saveLoading}
-              />
-            {:else}
-              <input
-                class="mdui-textfield-input"
-                type="password"
-                bind:value={config.secretAccessKey}
-                placeholder="留空表示不修改"
-                disabled={testLoading || saveLoading}
-              />
-            {/if}
-            <button
-              class="mdui-btn mdui-btn-icon toggle-visibility"
-              on:click={() => (showSecretKey = !showSecretKey)}
-              type="button"
-              tabindex="-1"
-            >
-              <i class="mdui-icon material-icons">
-                {showSecretKey ? "visibility_off" : "visibility"}
-              </i>
-            </button>
-          </div>
-          {#if config.secretAccessKey === ""}
-            <div class="mdui-textfield-helper">
-              如需修改 Secret Key，请在此输入
-            </div>
-          {/if}
-        </div>
-
-        <div class="mdui-textfield">
-          <label class="mdui-textfield-label">
-            Region
-            <span class="help-text">（默认: us-east-1）</span>
+          <label class="mdui-textfield-label" for="export-dir">
+            导出目录路径
+            <span class="help-text">（供本地 Python 导出脚本使用）</span>
           </label>
           <input
+            id="export-dir"
             class="mdui-textfield-input"
             type="text"
-            bind:value={config.region}
-            placeholder="us-east-1"
-            disabled={testLoading || saveLoading}
+            bind:value={config.exportDir}
+            placeholder="例如: D:/Notes/weread/"
+            disabled={saveLoading}
           />
         </div>
-
-        <div class="mdui-textfield">
-          <label class="mdui-textfield-label">
-            对象键名 (Key)
-            <span class="help-text">（默认: wereader_notes.db）</span>
-          </label>
-          <input
-            class="mdui-textfield-input"
-            type="text"
-            bind:value={config.key}
-            placeholder="wereader_notes.db"
-            disabled={testLoading || saveLoading}
-          />
-        </div>
-
-        <label class="mdui-checkbox">
-          <input
-            type="checkbox"
-            bind:checked={config.forcePathStyle}
-            disabled={testLoading || saveLoading}
-          />
-          <i class="mdui-checkbox-icon"></i>
-          使用路径样式 (Path-style)
-          <span class="help-text">（MinIO 等私有 S3 通常需要）</span>
-        </label>
 
         <div class="autosync-section">
           <label class="mdui-checkbox">
             <input
               type="checkbox"
               bind:checked={autoSyncConfig.enabled}
-              disabled={testLoading || saveLoading}
+              disabled={saveLoading}
             />
             <i class="mdui-checkbox-icon"></i>
-            启用定时自动同步到 S3
+            启用定时自动同步到数据库
           </label>
 
           {#if autoSyncConfig.enabled}
             <div class="mdui-textfield" style="margin-top: 8px;">
-              <label class="mdui-textfield-label">
+              <label class="mdui-textfield-label" for="sync-interval">
                 自动同步间隔
                 <span class="help-text">（到达间隔后自动在后台执行全量同步）</span>
               </label>
               <select
+                id="sync-interval"
                 class="mdui-textfield-input"
                 bind:value={autoSyncConfig.intervalHours}
-                disabled={testLoading || saveLoading}
+                disabled={saveLoading}
               >
                 <option value={1 / 60}>每 1 分钟（测试用）</option>
                 <option value={1}>每 1 小时</option>
@@ -344,50 +216,27 @@
             </div>
           {/if}
         </div>
-
-        <div class="help-section">
-          <div class="help-title">支持的服务:</div>
-          <ul class="help-list">
-            <li>AWS S3</li>
-            <li>S3Drive</li>
-            <li>MinIO</li>
-            <li>阿里云 OSS（S3 兼容模式）</li>
-            <li>腾讯云 COS（S3 兼容模式）</li>
-            <li>Cloudflare R2</li>
-          </ul>
-        </div>
       </div>
 
       <div class="mdui-card-actions settings-actions">
-        <button
-          class="mdui-btn mdui-btn-raised mdui-color-theme"
-          on:click={handleTest}
-          disabled={testLoading || saveLoading}
-        >
-          {#if testLoading}
-            <i class="mdui-icon material-icons mdui-spin">refresh</i>
-          {:else}
-            测试连接
-          {/if}
-        </button>
-        <button
-          class="mdui-btn mdui-btn-raised mdui-color-red"
-          on:click={handleClear}
-          disabled={testLoading || saveLoading}
-        >
-          清除配置
-        </button>
         <div class="spacer"></div>
         <button
           class="mdui-btn mdui-btn-raised mdui-color-theme"
           on:click={handleSave}
-          disabled={testLoading || saveLoading}
+          disabled={saveLoading}
         >
           {#if saveLoading}
             <i class="mdui-icon material-icons mdui-spin">refresh</i>
           {:else}
             保存配置
           {/if}
+        </button>
+        <button
+          class="mdui-btn mdui-btn-raised"
+          on:click={handleClose}
+          disabled={saveLoading}
+        >
+          关闭
         </button>
       </div>
     </div>
@@ -437,6 +286,16 @@
     flex: 1;
   }
 
+  .section-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: rgba(0, 0, 0, 0.6);
+    margin-top: 8px;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  }
+
   .mdui-textfield {
     margin-bottom: 12px;
   }
@@ -467,31 +326,10 @@
     cursor: not-allowed;
   }
 
-  .mdui-textfield-helper {
+  .help-text {
     font-size: 12px;
     color: rgba(0, 0, 0, 0.38);
-    margin-top: 4px;
-  }
-
-  .secret-input-wrapper {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-
-  .secret-input-wrapper .mdui-textfield-input {
-    flex: 1;
-    padding-right: 40px;
-  }
-
-  .toggle-visibility {
-    position: absolute;
-    right: 0;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 36px;
-    height: 36px;
-    padding: 6px;
+    margin-left: 4px;
   }
 
   .mdui-checkbox {
@@ -531,41 +369,11 @@
     transform: rotate(45deg);
   }
 
-  .help-text {
-    font-size: 12px;
-    color: rgba(0, 0, 0, 0.38);
-    margin-left: 4px;
-  }
-
   .autosync-section {
     margin-top: 16px;
     padding: 12px;
     background: #f0f4ff;
     border-radius: 4px;
-  }
-
-  .help-section {
-    margin-top: 16px;
-    padding: 12px;
-    background: #f5f5f5;
-    border-radius: 4px;
-  }
-
-  .help-title {
-    font-size: 14px;
-    font-weight: 500;
-    margin-bottom: 8px;
-  }
-
-  .help-list {
-    margin: 0;
-    padding-left: 20px;
-    font-size: 13px;
-    color: rgba(0, 0, 0, 0.6);
-  }
-
-  .help-list li {
-    margin-bottom: 4px;
   }
 
   .mdui-alert {
@@ -604,11 +412,6 @@
 
   .mdui-color-theme {
     background-color: #3f51b5;
-    color: white;
-  }
-
-  .mdui-color-red {
-    background-color: #f44336;
     color: white;
   }
 
