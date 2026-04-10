@@ -298,6 +298,7 @@ export async function deleteHighlight(
 
 /**
  * 更新划线的评论/想法
+ * @returns true 如果成功更新或无需更新，false 如果找不到对应划线
  */
 export async function updateHighlightNote(
   db: any,
@@ -307,9 +308,7 @@ export async function updateHighlightNote(
   range: string,
   noteText: string,
   stats?: { reviewsMerged?: number }
-): Promise<void> {
-  console.log("[updateHighlightNote] 参数:", { userVid, bookId, chapterUid, range, noteText });
-
+): Promise<boolean> {
   // 查询现有记录
   const existing = await request(
     "GET",
@@ -317,14 +316,15 @@ export async function updateHighlightNote(
   );
 
   if (!existing || existing.length === 0) {
-    console.warn("[updateHighlightNote] 未找到对应 highlight，跳过:", { userVid, bookId, chapterUid, range });
-    return;
+    // 这种情况正常：用户可能先写了评论，后来删除了对应的划线
+    // 或者微信读书的书摘类型评论没有对应划线
+    return false;
   }
 
   const currentNoteText = existing[0].note_text || "";
   if (currentNoteText === (noteText || "")) {
     // 内容相同，跳过
-    return;
+    return true;
   }
 
   await request(
@@ -334,6 +334,7 @@ export async function updateHighlightNote(
   );
 
   if (stats) stats.reviewsMerged = (stats.reviewsMerged || 0) + 1;
+  return true;
 }
 
 /**
@@ -513,15 +514,19 @@ export async function syncBookToDatabase(
 
     // 6. 合并评论/想法
     console.log("[syncBookToDatabase] 步骤6: 合并评论/想法，评论数:", reviewData?.reviews?.length || 0);
+    let skippedReviews = 0;
+    let orphanedReviews = 0;
     if (reviewData?.reviews) {
       for (const reviewItem of reviewData.reviews) {
         const review = reviewItem.review;
+        // 检查评论数据完整性
         if (!review || review.chapterUid == null || !review.range || review.content == null) {
-          console.warn("[syncBookToDatabase] 跳过不合法评论:", review);
+          skippedReviews++;
+          console.log("[syncBookToDatabase] 跳过格式不完整的评论（可能是系统-generated的摘要）");
           continue;
         }
-        console.log("[syncBookToDatabase] 处理评论:", { chapterUid: review.chapterUid, range: review.range, content: review.content.substring(0, 50) });
-        await updateHighlightNote(
+        // 尝试更新对应划线的评论
+        const result = await updateHighlightNote(
           db,
           userVid,
           bookData.book.bookId,
@@ -530,7 +535,13 @@ export async function syncBookToDatabase(
           review.content,
           stats
         );
+        if (!result) {
+          orphanedReviews++;
+        }
       }
+    }
+    if (skippedReviews > 0 || orphanedReviews > 0) {
+      console.log(`[syncBookToDatabase] 评论处理统计: ${skippedReviews} 个格式跳过, ${orphanedReviews} 个孤立评论（划线可能已删除）`);
     }
 
     // 7. 更新同步状态
