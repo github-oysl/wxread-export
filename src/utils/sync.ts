@@ -4,7 +4,6 @@
  */
 
 import { initSqlite, getSyncKeyForApi } from "./db";
-import { isS3Configured, getS3Config, downloadFromS3, exportToS3 } from "./s3";
 
 /**
  * 从 weread.qq.com 的 cookie 中读取 wr_vid 作为固定用户 ID
@@ -40,7 +39,7 @@ export function getWrVidFromCookie() {
  * 获取单本书的同步数据
  */
 export async function fetchBookData(book: any, userVidStr: string, dbForSyncKey: any) {
-  const lastSyncKey = getSyncKeyForApi(dbForSyncKey, userVidStr, book.bookId);
+  const lastSyncKey = await getSyncKeyForApi(dbForSyncKey, userVidStr, book.bookId);
   const [markData, reviewData, progressData] = await Promise.all([
     fetch(
       `https://weread.qq.com/web/book/bookmarklist?bookId=${book.bookId}&synckey=${lastSyncKey}`
@@ -84,10 +83,10 @@ export async function fetchBookData(book: any, userVidStr: string, dbForSyncKey:
 }
 
 /**
- * 同步所有书籍到 S3
+ * 同步所有书籍到数据库（PostgreSQL）
  * @returns 同步结果，包含增量统计
  */
-export async function syncAllBooksToS3(): Promise<{
+export async function syncAllBooksToDatabase(): Promise<{
   success: boolean;
   message: string;
   stats?: {
@@ -112,39 +111,17 @@ export async function syncAllBooksToS3(): Promise<{
     return { success: false, message: "暂无书籍可导出" };
   }
 
-  // 2. 检查 S3 配置
-  const useS3 = await isS3Configured();
-  if (!useS3) {
-    return { success: false, message: "S3 未配置" };
-  }
-
-  // 3. 初始化 sql.js
+  // 2. 初始化 PostgREST 连接
   await initSqlite();
 
-  // 4. 动态导入 db 模块（浏览器扩展中 sql.js 是动态的）
+  // 3. 动态导入 db 模块
   const dbModule = await import("./db");
 
-  // 5. 尝试从 S3 下载现有数据库
-  let s3Db: any = null;
-  const s3Config = await getS3Config();
-  if (s3Config) {
-    try {
-      const existingData = await downloadFromS3(s3Config);
-      if (existingData) {
-        s3Db = dbModule.loadDatabase(existingData);
-        console.log("[Sync] 已从 S3 加载现有数据库，大小:", existingData.byteLength, "字节");
-      }
-    } catch (e) {
-      console.log("[Sync] 从 S3 下载数据库失败，将创建新数据库:", e);
-    }
-  }
+  // 4. 创建数据库连接（PostgREST 模式）
+  const db = dbModule.createDatabase();
+  console.log("[Sync] 已连接到 PostgREST 数据库");
 
-  if (!s3Db) {
-    s3Db = dbModule.createDatabase();
-    console.log("[Sync] 创建了新的数据库用于 S3 导出");
-  }
-
-  // 6. 获取 effectiveUserVid
+  // 5. 获取 effectiveUserVid
   let effectiveUserVid = await getWrVidFromCookie();
   if (!effectiveUserVid) {
     effectiveUserVid =
@@ -183,10 +160,10 @@ export async function syncAllBooksToS3(): Promise<{
       const { bookData, reviewData, progressInfo } = await fetchBookData(
         book,
         effectiveUserVid,
-        s3Db
+        db
       );
-      const bookStats = dbModule.syncBookToDatabase(
-        s3Db,
+      const bookStats = await dbModule.syncBookToDatabase(
+        db,
         effectiveUserVid,
         bookData,
         reviewData,
@@ -214,18 +191,13 @@ export async function syncAllBooksToS3(): Promise<{
     }
   }
 
-  // 8. 上传到 S3
-  const result = await exportToS3(s3Db, "全部笔记");
+  // 8. （可选）上传到 S3 - 现在数据已直接保存到 PostgreSQL，S3 备份可选
+  // const result = await exportToS3(s3Db, "全部笔记");
 
   // 9. 获取最终统计
-  const stats = dbModule.getUserSyncStats(s3Db, effectiveUserVid);
+  const stats = await dbModule.getUserSyncStats(db, effectiveUserVid);
 
-  // 10. 关闭数据库
-  s3Db.close();
-
-  if (!result.success) {
-    return { success: false, message: result.message };
-  }
+  // 10. PostgREST 不需要关闭连接
 
   return {
     success: true,
@@ -241,6 +213,28 @@ export async function syncAllBooksToS3(): Promise<{
       totalRemoved,
       totalReviews,
     },
-    url: result.url,
   };
+}
+
+/**
+ * 同步所有书籍到 S3（别名，保持向后兼容）
+ * @deprecated 请使用 syncAllBooksToDatabase
+ */
+export async function syncAllBooksToS3(): Promise<{
+  success: boolean;
+  message: string;
+  stats?: {
+    bookCount: number;
+    highlightCount: number;
+    successCount: number;
+    failCount: number;
+    changedBooks: number;
+    totalAdded: number;
+    totalUpdated: number;
+    totalRemoved: number;
+    totalReviews: number;
+  };
+  url?: string;
+}> {
+  return syncAllBooksToDatabase();
 }

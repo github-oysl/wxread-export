@@ -1,51 +1,25 @@
 <script>
-  import {
-    isFileSystemAccessSupported,
-    exportToSQLite,
-    getSyncKeyForApi,
-    requestFileAccess,
-    saveDatabaseToFile,
-    downloadDatabaseFile,
-  } from "../../utils/file";
-  import { initSqlite } from "../../utils/db";
+  import { getSyncKeyForApi } from "../../utils/file";
   import { isS3Configured } from "../../utils/s3";
-  import { syncAllBooksToS3, fetchBookData, getWrVidFromCookie } from "../../utils/sync";
+  import { syncAllBooksToDatabase, fetchBookData, getWrVidFromCookie } from "../../utils/sync";
   import Settings from "./Settings.svelte";
 
   export let userVid;
   let books = [],
     selectedBook;
   let isExporting = false;
-  let hasFileHandle = false;
   let errorMessage = "";
   let showError = false;
   let showSettings = false;
   let s3Configured = false;
 
-  // 检查 S3 是否已配置
+  // 检查 S3 是否已配置（保留用于设置按钮显示）
   async function checkS3Config() {
     s3Configured = await isS3Configured();
   }
 
   // 页面加载时检查 S3 配置
   checkS3Config();
-
-  // 检查是否已有保存的数据库文件
-  async function checkSavedFile() {
-    try {
-      // 安全检查 browser API
-      if (typeof browser === "undefined" || !browser.storage) {
-        console.warn("[checkSavedFile] Browser storage API 不可用");
-        hasFileHandle = false;
-        return;
-      }
-      const result = await browser.storage.local.get("wereader_db_file_name");
-      hasFileHandle = !!result["wereader_db_file_name"];
-    } catch (e) {
-      console.warn("[checkSavedFile] 检查失败:", e);
-      hasFileHandle = false;
-    }
-  }
 
   async function getNoteBooks() {
     // 优先从 cookie 读取 wr_vid
@@ -73,14 +47,14 @@
       });
   }
   getNoteBooks();
-  checkSavedFile();
 
   function handleClick(book) {
     selectedBook = book.bookId;
   }
 
   /**
-   * 导出到 SQLite 数据库
+   * 导出到 PostgreSQL 数据库
+   * 批量导出所有书籍到远程数据库
    */
   async function exportToDatabase() {
     if (isExporting) return;
@@ -90,189 +64,36 @@
     }
 
     isExporting = true;
-    /** @type {string[]} */
-    let debugInfo = [];
-
-    // 诊断函数
-    const diagnose = (step, info) => {
-      const msg = `[诊断] ${step}: ${JSON.stringify(info)}`;
-      console.log(msg);
-      debugInfo.push(msg);
-    };
 
     try {
-      // 预检查：验证 wasm 文件可访问性
-      diagnose("开始", "检查 wasm 文件可访问性");
+      // 批量导出所有书籍到数据库
+      const result = await syncAllBooksToDatabase();
 
-      const testUrls = [
-        browser.runtime.getURL("assets/sql-wasm.wasm"),
-      ];
+      if (result.success) {
+        const s = result.stats;
+        let message = "导出到数据库成功！";
 
-      for (const url of testUrls) {
-        try {
-          const response = await fetch(url, { method: 'HEAD' });
-          diagnose("wasm 检查", { url, status: response.status, ok: response.ok });
-        } catch (e) {
-          diagnose("wasm 检查失败", { url, error: String(e) });
-        }
-      }
-
-      // 检查浏览器支持
-      const isSupported = isFileSystemAccessSupported();
-      diagnose("浏览器支持", { isSupported });
-
-      // 检查是否配置了 S3，如果配置了优先使用 S3 导出
-      const useS3 = await isS3Configured();
-      diagnose("导出方式选择", { useS3, s3Configured: useS3, isSupported });
-
-      if (useS3) {
-        // S3 导出模式：调用核心同步模块
-        diagnose("开始 S3 同步", { bookCount: books.length });
-        const result = await syncAllBooksToS3();
-
-        if (result.success) {
-          const s = result.stats;
-          let message = "同步到 S3 成功！";
-          if (s) {
-            const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
-            if (hasChanges) {
-              const details = [];
-              if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
-              if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
-              if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
-              if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
-              message += `\n\n本次变更：涉及 ${s.changedBooks} 本书`;
-              if (details.length > 0) message += `\n${details.join("，")}`;
-            } else {
-              message += "\n\n本次无新增变更，所有笔记已是最新。";
-            }
-            message += `\n\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
-            if (result.url) message += `\n\n文件地址: ${result.url}`;
+        if (s) {
+          const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
+          if (hasChanges) {
+            const details = [];
+            if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
+            if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
+            if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
+            if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
+            message += `\n\n本次变更：涉及 ${s.changedBooks} 本书`;
+            if (details.length > 0) message += `\n${details.join("，")}`;
+          } else {
+            message += "\n\n本次无新增变更，所有笔记已是最新。";
           }
-          alert(message);
-        } else {
-          throw new Error(result.message);
+          message += `\n\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
+          if (s.failCount > 0) {
+            message += `\n\n注意：${s.failCount} 本书导出失败。`;
+          }
         }
-        return;
-      }
-
-      // 本地文件导出模式（保持单本书逻辑）
-      if (!selectedBook) {
-        alert("请先选择一本书");
-        isExporting = false;
-        return;
-      }
-
-      // 获取上次同步状态（用于增量更新）
-      let db = null;
-      let fileHandle = null;
-
-      if (isSupported && hasFileHandle) {
-        try {
-          // 尝试打开已有文件
-          const result = await requestFileAccess();
-          db = result.db;
-          fileHandle = result.fileHandle;
-        } catch (e) {
-          console.log("打开已有文件失败，将创建新文件或下载:", e);
-        }
-      }
-
-      // 获取书籍数据
-      const book = books.find((b) => b.bookId === selectedBook);
-      if (!book) {
-        throw new Error("未找到选中的书籍");
-      }
-
-      const { bookData, reviewData, progressInfo, markData } = await fetchBookData(
-        book,
-        userVid || "",
-        db
-      );
-
-      // 获取 effectiveUserVid（优先 cookie -> 已有 userVid -> API 响应 -> 兜底）
-      let effectiveUserVid = userVid || (await getWrVidFromCookie());
-      if (!effectiveUserVid) {
-        effectiveUserVid = markData?.userVid || markData?.user?.vid || reviewData?.userVid || reviewData?.user?.vid || "";
-      }
-      if (!effectiveUserVid) {
-        effectiveUserVid = "unknown_user";
-      }
-
-      if (isSupported && !db) {
-        // 使用自动文件管理模式（首次导出）
-        diagnose("调用 exportToSQLite", { userVid: effectiveUserVid, bookId: selectedBook });
-        diagnose("reviewData 检查", { hasReviewData: !!reviewData, reviewCount: reviewData.reviews?.length || 0 });
-        const result = await exportToSQLite(
-          effectiveUserVid,
-          bookData,
-          reviewData,
-          progressInfo,
-          true
-        );
-        diagnose("exportToSQLite 返回", { success: result.success });
-
-        if (result.success) {
-          hasFileHandle = true;
-          alert(
-            `${result.message}\n\n您已导出 ${result.stats.bookCount} 本书的 ${result.stats.highlightCount} 条笔记。\n\n下次导出将自动使用同一文件进行增量更新。`
-          );
-        } else {
-          diagnose("exportToSQLite 返回失败", { message: result.message });
-          throw new Error(result.message);
-        }
-      } else if (db && fileHandle) {
-        // 已有打开的数据库，直接同步
-        await initSqlite();
-
-        // 动态导入 db 模块
-        const dbModule = await import("../../utils/db");
-        dbModule.syncBookToDatabase(
-          db,
-          effectiveUserVid,
-          bookData,
-          reviewData,
-          progressInfo
-        );
-
-        // 保存到文件
-        await saveDatabaseToFile(fileHandle, db);
-
-        // 获取统计信息
-        const stats = dbModule.getUserSyncStats(db, effectiveUserVid);
-
-        // 关闭数据库
-        db.close();
-
-        alert(
-          `成功更新数据库：${book.title}\n\n您已导出 ${stats.bookCount} 本书的 ${stats.highlightCount} 条笔记。`
-        );
+        alert(message);
       } else {
-        // 浏览器不支持 File System Access API，使用降级方案
-        await initSqlite();
-
-        // 创建新数据库
-        const dbModule = await import("../../utils/db");
-        const newDb = dbModule.createDatabase();
-
-        // 同步数据
-        dbModule.syncBookToDatabase(
-          newDb,
-          effectiveUserVid,
-          bookData,
-          reviewData,
-          progressInfo
-        );
-
-        // 下载文件
-        downloadDatabaseFile(newDb, `wereader_notes_${book.title}.db`);
-
-        // 关闭数据库
-        newDb.close();
-
-        alert(
-          `已生成数据库文件并触发下载：wereader_notes_${book.title}.db\n\n由于您的浏览器不支持文件系统访问 API，每次导出都会生成新文件。推荐使用 Chrome 或 Edge 浏览器以获得更好的体验。`
-        );
+        throw new Error(result.message);
       }
     } catch (error) {
       console.error("导出到数据库失败:", error);
@@ -293,12 +114,9 @@
         errorMsg = `无法序列化错误: ${String(error)}`;
       }
 
-      const fullDebug = debugInfo.join("\n");
       errorMessage =
         `导出失败: ${errorMsg}\n\n` +
-        `扩展 ID: ${browser.runtime.id}\n` +
-        `预期 wasm URL: ${browser.runtime.getURL("assets/sql-wasm.wasm")}\n\n` +
-        `诊断日志:\n${fullDebug}`;
+        `扩展 ID: ${browser.runtime.id}`;
       showError = true;
     } finally {
       isExporting = false;
@@ -320,11 +138,9 @@
     class="mdui-btn mdui-btn-icon"
     on:click={exportToDatabase}
     disabled={isExporting}
-    title={isExporting ? "正在导出..." : s3Configured ? "导出到 S3" : "导出到 SQLite 数据库"}
+    title={isExporting ? "正在导出所有书籍..." : "批量导出所有书籍到数据库"}
   >
-    <i class="mdui-icon material-icons">
-      {s3Configured ? "cloud_upload" : "storage"}
-    </i>
+    <i class="mdui-icon material-icons">cloud_upload</i>
   </button>
 </div>
 
