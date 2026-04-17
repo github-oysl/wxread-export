@@ -4,6 +4,7 @@
  */
 
 import { syncAllBooksToDatabase } from "../utils/sync";
+import { exportAllBooksToLocal } from "../utils/export";
 
 // 由于项目中未安装 @types/chrome，在此处做最小声明
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -158,7 +159,7 @@ export default defineBackground(() => {
           const s = result.stats;
           let message = "";
           if (s) {
-            const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
+            const hasChanges = s.changedBooks > 0;
             if (hasChanges) {
               const details: string[] = [];
               if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
@@ -167,11 +168,22 @@ export default defineBackground(() => {
               if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
               message += `本次变更：涉及 ${s.changedBooks} 本书`;
               if (details.length > 0) message += `\n${details.join("，")}`;
+
+              // 有变更时才尝试导出本地 Markdown
+              try {
+                const exportResult = await exportAllBooksToLocal();
+                if (exportResult.exportedCount > 0) {
+                  message += `\n已自动导出 ${exportResult.exportedCount} 本书到本地 Markdown。`;
+                }
+              } catch (exportErr) {
+                console.error("[Background] 自动导出 Markdown 失败:", exportErr);
+              }
             } else {
               message += "本次无新增变更，所有笔记已是最新。";
             }
             message += `\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
           }
+
           console.log("[Background] 自动同步成功:\n", message);
           notifySyncResult("微信读书自动同步成功", message);
         } else {

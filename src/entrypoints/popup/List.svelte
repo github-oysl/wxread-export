@@ -1,11 +1,18 @@
 <script>
   import { getSyncKeyForApi } from "../../utils/file";
-  import { syncAllBooksToDatabase, fetchBookData, getWrVidFromCookie } from "../../utils/sync";
+  import { syncAllBooksToDatabase, syncSingleBookToDatabase, getWrVidFromCookie } from "../../utils/sync";
+  import {
+    exportAllBooksToLocal,
+    exportBookToLocal,
+    exportAllBooksToLocalDirect,
+    exportBookToLocalDirect,
+    checkDatabaseAvailable,
+  } from "../../utils/export";
   import Settings from "./Settings.svelte";
 
   export let userVid;
-  let books = [],
-    selectedBook;
+  let books = [];
+  let selectedBook = "all";
   let isExporting = false;
   let errorMessage = "";
   let showError = false;
@@ -23,9 +30,8 @@
       .then((response) => response.json())
       .then((data) => {
         books = data.books.map((val) => val.book);
-        if (books.length > 0) {
-          selectedBook = books[0].bookId;
-        }
+        // 默认状态为全部，不自动选中任何单本书
+        selectedBook = "all";
         // 如果 cookie 没有，再尝试从 API 响应兜底
         if (!userVid) {
           const fixedUserVid = data.userVid || data.vid || data.books?.[0]?.userVid || data.books?.[0]?.vid;
@@ -39,14 +45,46 @@
   getNoteBooks();
 
   function handleClick(book) {
-    selectedBook = book.bookId;
+    if (selectedBook === book.bookId) {
+      selectedBook = "all";
+    } else {
+      selectedBook = book.bookId;
+    }
+  }
+
+  function showErrorPanel(error) {
+    let errorMsg;
+    try {
+      if (error instanceof Error) {
+        errorMsg = `${error.message}\n${error.stack || ""}`;
+      } else if (typeof error === "string") {
+        errorMsg = error;
+      } else if (error && typeof error === "object") {
+        errorMsg = `非标准错误: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`;
+      } else {
+        errorMsg = `未知错误: ${String(error)}`;
+      }
+    } catch (e) {
+      errorMsg = `无法序列化错误: ${String(error)}`;
+    }
+
+    errorMessage =
+      `导出失败: ${errorMsg}\n\n` +
+      `扩展 ID: ${browser.runtime.id}`;
+    showError = true;
+  }
+
+  function getSelectedBookTitle() {
+    const book = books.find((b) => b.bookId === selectedBook);
+    return book?.title || "";
   }
 
   /**
-   * 导出到 PostgreSQL 数据库
-   * 批量导出所有书籍到远程数据库
+   * 一键同步并导出
+   * 有数据库：先同步到数据库，再增量导出本地
+   * 无数据库：直接全量导出本地
    */
-  async function exportToDatabase() {
+  async function syncAndExport() {
     if (isExporting) return;
     if (books.length === 0) {
       alert("暂无书籍可导出");
@@ -56,60 +94,81 @@
     isExporting = true;
 
     try {
-      // 批量导出所有书籍到数据库
-      const result = await syncAllBooksToDatabase();
+      const hasDb = await checkDatabaseAvailable();
+      const isSingle = selectedBook && selectedBook !== "all";
 
-      if (result.success) {
-        const s = result.stats;
-        let message = "导出到数据库成功！";
-
-        if (s) {
-          message += `\n\n处理书籍：${s.successCount} 本成功`;
-          if (s.failCount > 0) {
-            message += `，${s.failCount} 本失败`;
+      if (hasDb) {
+        // 有数据库：先同步，再根据是否有变更决定是否导出
+        if (isSingle) {
+          const book = books.find((b) => b.bookId === selectedBook);
+          const dbResult = await syncSingleBookToDatabase(book);
+          if (!dbResult.success) {
+            throw new Error(dbResult.message || "同步失败");
           }
-
-          const hasChanges = s.totalAdded > 0 || s.totalUpdated > 0 || s.totalRemoved > 0 || s.totalReviews > 0;
+          const hasChanges = dbResult.stats && (
+            dbResult.stats.highlightsAdded > 0 ||
+            dbResult.stats.highlightsUpdated > 0 ||
+            dbResult.stats.highlightsRemoved > 0 ||
+            dbResult.stats.reviewsMerged > 0
+          );
           if (hasChanges) {
-            const details = [];
-            if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
-            if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
-            if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
-            if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
-            message += `\n有变更的书籍：${s.changedBooks} 本`;
-            if (details.length > 0) message += `\n${details.join("，")}`;
+            const localResult = await exportBookToLocal(book.bookId);
+            alert(`《${book.title}》同步并导出完成！\n${localResult.message}`);
           } else {
-            message += "\n\n本次无新增变更，所有笔记已是最新。";
+            alert(`《${book.title}》同步完成，本书无新增变更。`);
           }
-          message += `\n\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
+        } else {
+          const dbResult = await syncAllBooksToDatabase();
+          if (!dbResult.success) {
+            throw new Error(dbResult.message || "同步失败");
+          }
+          let msg = "数据库同步成功！";
+          let hasChanges = false;
+          if (dbResult.stats) {
+            const s = dbResult.stats;
+            msg += `\n处理书籍：${s.successCount} 本成功`;
+            if (s.failCount > 0) msg += `，${s.failCount} 本失败`;
+            hasChanges = s.changedBooks > 0;
+            if (hasChanges) {
+              const details = [];
+              if (s.totalAdded > 0) details.push(`新增 ${s.totalAdded} 条笔记`);
+              if (s.totalUpdated > 0) details.push(`更新 ${s.totalUpdated} 条笔记`);
+              if (s.totalRemoved > 0) details.push(`删除 ${s.totalRemoved} 条`);
+              if (s.totalReviews > 0) details.push(`合并想法 ${s.totalReviews} 条`);
+              msg += `\n有变更的书籍：${s.changedBooks} 本`;
+              if (details.length > 0) msg += `\n${details.join("，")}`;
+            } else {
+              msg += "\n本次无新增变更，所有笔记已是最新。";
+            }
+            msg += `\n数据库总计：${s.bookCount} 本书，${s.highlightCount} 条笔记。`;
+          }
+          if (hasChanges) {
+            const localResult = await exportAllBooksToLocal();
+            alert(`${msg}\n\n本地导出：${localResult.message}`);
+          } else {
+            alert(msg);
+          }
         }
-        alert(message);
       } else {
-        throw new Error(result.message);
+        // 无数据库：全量导出
+        if (isSingle) {
+          const book = books.find((b) => b.bookId === selectedBook);
+          const localResult = await exportBookToLocalDirect(book);
+          if (!localResult.success) {
+            throw new Error(localResult.message);
+          }
+          alert(`《${book.title}》已全量导出到本地。\n${localResult.message}`);
+        } else {
+          const localResult = await exportAllBooksToLocalDirect();
+          if (!localResult.success) {
+            throw new Error(localResult.message);
+          }
+          alert(`数据库不可用，已切换为全量本地导出。\n${localResult.message}`);
+        }
       }
     } catch (error) {
-      console.error("导出到数据库失败:", error);
-
-      // 增强错误信息提取
-      let errorMsg;
-      try {
-        if (error instanceof Error) {
-          errorMsg = `${error.message}\n${error.stack || ""}`;
-        } else if (typeof error === "string") {
-          errorMsg = error;
-        } else if (error && typeof error === "object") {
-          errorMsg = `非标准错误: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`;
-        } else {
-          errorMsg = `未知错误: ${String(error)}`;
-        }
-      } catch (e) {
-        errorMsg = `无法序列化错误: ${String(error)}`;
-      }
-
-      errorMessage =
-        `导出失败: ${errorMsg}\n\n` +
-        `扩展 ID: ${browser.runtime.id}`;
-      showError = true;
+      console.error("同步并导出失败:", error);
+      showErrorPanel(error);
     } finally {
       isExporting = false;
     }
@@ -128,9 +187,13 @@
   </button>
   <button
     class="mdui-btn mdui-btn-icon"
-    on:click={exportToDatabase}
+    on:click={syncAndExport}
     disabled={isExporting}
-    title={isExporting ? "正在导出所有书籍..." : "批量导出所有书籍到数据库"}
+    title={isExporting
+      ? "正在处理..."
+      : selectedBook && selectedBook !== "all"
+        ? `同步并导出《${getSelectedBookTitle()}》`
+        : "一键同步并导出所有书籍"}
   >
     <i class="mdui-icon material-icons">cloud_upload</i>
   </button>

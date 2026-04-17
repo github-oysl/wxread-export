@@ -8,6 +8,7 @@
 
   let config = {
     postgrestUrl: "",
+    jwtToken: "",
     exportDir: "",
   };
 
@@ -35,6 +36,7 @@
 
         if (pgConfig) {
           config.postgrestUrl = pgConfig.postgrestUrl || "";
+          config.jwtToken = pgConfig.jwtToken || "";
         }
         if (exportConfig) {
           config.exportDir = exportConfig.exportDir || "";
@@ -71,6 +73,7 @@
         await browser.storage.local.set({
           [POSTGREST_CONFIG_KEY]: {
             postgrestUrl: config.postgrestUrl.trim(),
+            jwtToken: config.jwtToken.trim(),
           },
           [EXPORT_CONFIG_KEY]: {
             exportDir: config.exportDir.trim(),
@@ -166,19 +169,33 @@
             disabled={saveLoading}
           />
         </div>
+        <div class="mdui-textfield">
+          <label class="mdui-textfield-label" for="jwt-token">
+            JWT Token
+            <span class="help-text">（开启 JWT 认证后必填）</span>
+          </label>
+          <input
+            id="jwt-token"
+            class="mdui-textfield-input"
+            type="password"
+            bind:value={config.jwtToken}
+            placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+            disabled={saveLoading}
+          />
+        </div>
 
         <div class="section-title">本地导出配置</div>
         <div class="mdui-textfield">
           <label class="mdui-textfield-label" for="export-dir">
             导出目录路径
-            <span class="help-text">（供本地 Python 导出脚本使用）</span>
+            <span class="help-text">（相对于浏览器下载目录的路径前缀，例如：wereader-export）</span>
           </label>
           <input
             id="export-dir"
             class="mdui-textfield-input"
             type="text"
             bind:value={config.exportDir}
-            placeholder="例如: D:/Notes/weread/"
+            placeholder="例如: wereader-export"
             disabled={saveLoading}
           />
         </div>

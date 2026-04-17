@@ -1,9 +1,44 @@
 /**
- * S3 全量同步核心逻辑
+ * 同步核心逻辑
  * 供 popup 手动触发和 background 定时触发共用
  */
 
 import { initSqlite, getSyncKeyForApi } from "./db";
+
+const CACHED_USER_VID_KEY = "wereader_cached_user_vid";
+
+/**
+ * 从扩展存储中读取缓存的 userVid
+ */
+async function getCachedUserVid(): Promise<string | null> {
+  try {
+    if (typeof browser !== "undefined" && browser.storage) {
+      const res = await browser.storage.local.get(CACHED_USER_VID_KEY);
+      const cached = res[CACHED_USER_VID_KEY];
+      if (cached) {
+        console.log("[Sync] 从缓存读取 userVid:", cached);
+        return String(cached);
+      }
+    }
+  } catch (e) {
+    console.error("[Sync] 读取缓存 userVid 失败:", e);
+  }
+  return null;
+}
+
+/**
+ * 将 userVid 写入扩展存储缓存
+ */
+async function setCachedUserVid(userVid: string): Promise<void> {
+  try {
+    if (typeof browser !== "undefined" && browser.storage) {
+      await browser.storage.local.set({ [CACHED_USER_VID_KEY]: userVid });
+      console.log("[Sync] 已缓存 userVid:", userVid);
+    }
+  } catch (e) {
+    console.error("[Sync] 缓存 userVid 失败:", e);
+  }
+}
 
 /**
  * 从 weread.qq.com 的 cookie 中读取 wr_vid 作为固定用户 ID
@@ -36,21 +71,89 @@ export function getWrVidFromCookie() {
 }
 
 /**
+ * 统一解析 effectiveUserVid
+ * 优先读取缓存，其次 cookie，再次 notebookData，必要时请求第一本书的 bookmarklist
+ */
+export async function resolveEffectiveUserVid(notebookData?: any): Promise<string> {
+  // 1. 优先读取缓存
+  let userVid = await getCachedUserVid();
+  if (userVid) {
+    return userVid;
+  }
+
+  // 2. 尝试 cookie
+  userVid = await getWrVidFromCookie();
+  if (userVid) {
+    await setCachedUserVid(userVid);
+    return userVid;
+  }
+
+  // 3. 从 notebookData 回退提取
+  if (notebookData) {
+    userVid =
+      notebookData.userVid ||
+      notebookData.vid ||
+      notebookData.books?.[0]?.userVid ||
+      notebookData.books?.[0]?.vid ||
+      "";
+    if (userVid) {
+      userVid = String(userVid);
+      await setCachedUserVid(userVid);
+      return userVid;
+    }
+  }
+
+  // 4. 如果提供了 books 列表，请求第一本书的 bookmarklist 提取 userVid
+  const books = notebookData?.books?.map((val: any) => val.book) as any[];
+  if (books && books.length > 0) {
+    try {
+      const firstMark = await fetch(
+        `https://weread.qq.com/web/book/bookmarklist?bookId=${books[0].bookId}&synckey=0`
+      ).then((r) => r.json());
+      userVid = firstMark?.userVid || firstMark?.user?.vid || "";
+      if (userVid) {
+        userVid = String(userVid);
+        await setCachedUserVid(userVid);
+        return userVid;
+      }
+    } catch (e) {
+      console.error("[Sync] 从 bookmarklist 提取 userVid 失败:", e);
+    }
+  }
+
+  // 5. 兜底
+  return "unknown_user";
+}
+
+/**
  * 获取单本书的同步数据
  */
 export async function fetchBookData(book: any, userVidStr: string, dbForSyncKey: any) {
   const lastSyncKey = await getSyncKeyForApi(dbForSyncKey, userVidStr, book.bookId);
+
+  console.log(
+    `[fetchBookData] userVid=${userVidStr}, bookId=${book.bookId}, lastSyncKey=${lastSyncKey}`
+  );
+
   const [markData, reviewData, progressData] = await Promise.all([
     fetch(
       `https://weread.qq.com/web/book/bookmarklist?bookId=${book.bookId}&synckey=${lastSyncKey}`
     ).then((resp) => resp.json()),
     fetch(
-      `https://weread.qq.com/web/review/list?bookId=${book.bookId}&mine=1&listType=11&maxIdx=0&count=0&listMode=2&synckey=0&userVid=${userVidStr}`
+      `https://weread.qq.com/web/review/list?bookId=${book.bookId}&mine=1&listType=11&maxIdx=0&count=0&listMode=2&synckey=${lastSyncKey}&userVid=${userVidStr}`
     ).then((resp) => resp.json()),
     fetch(
       `https://weread.qq.com/web/book/getProgress?bookId=${book.bookId}`
     ).then((resp) => resp.json()),
   ]);
+
+  // 防御性字段探测：优先使用 synckey，其次 syncKey
+  const apiSyncKey = markData.synckey ?? markData.syncKey;
+  const resolvedSyncKey = apiSyncKey ?? lastSyncKey + 1;
+
+  console.log(
+    `[fetchBookData] API返回 synckey=${apiSyncKey}, resolvedSyncKey=${resolvedSyncKey}, updated=${(markData.updated || markData.marks || []).length}, removed=${(markData.removed || []).length}`
+  );
 
   const bookData = {
     book: {
@@ -63,7 +166,7 @@ export async function fetchBookData(book: any, userVidStr: string, dbForSyncKey:
     chapters: markData.chapters || [],
     updated: markData.updated || markData.marks || [],
     removed: markData.removed || [],
-    synckey: markData.synckey || lastSyncKey + 1,
+    synckey: resolvedSyncKey,
   };
 
   const progressInfo = progressData.book
@@ -80,6 +183,64 @@ export async function fetchBookData(book: any, userVidStr: string, dbForSyncKey:
     progressInfo,
     markData,
   };
+}
+
+/**
+ * 同步单本书到数据库
+ * 如果未传入 db/dbModule/effectiveUserVid，则自动初始化
+ */
+export async function syncSingleBookToDatabase(
+  book: any,
+  effectiveUserVid?: string,
+  db?: any,
+  dbModule?: any
+): Promise<{
+  success: boolean;
+  stats?: {
+    highlightsAdded: number;
+    highlightsUpdated: number;
+    highlightsRemoved: number;
+    reviewsMerged: number;
+  };
+  message?: string;
+}> {
+  let localDb = db;
+  let localDbModule = dbModule;
+  let localUserVid: string | null | undefined = effectiveUserVid;
+
+  // 自动初始化数据库连接
+  if (!localDb || !localDbModule) {
+    await initSqlite();
+    localDbModule = await import("./db");
+    localDb = await localDbModule.createDatabase();
+  }
+
+  // 自动解析 userVid（统一入口）
+  if (!localUserVid) {
+    localUserVid = await resolveEffectiveUserVid();
+  }
+
+  if (!localUserVid) {
+    localUserVid = "unknown_user";
+  }
+
+  try {
+    const data = await fetchBookData(book, localUserVid, localDb);
+    const stats = await localDbModule.syncBookToDatabase(
+      localDb,
+      localUserVid,
+      data.bookData,
+      data.reviewData,
+      data.progressInfo
+    );
+    return { success: true, stats };
+  } catch (e) {
+    console.error(`[syncSingleBookToDatabase] 同步失败 ${book.title}:`, e);
+    return {
+      success: false,
+      message: e instanceof Error ? e.message : String(e),
+    };
+  }
 }
 
 /**
@@ -121,28 +282,8 @@ export async function syncAllBooksToDatabase(): Promise<{
   const db = await dbModule.createDatabase();
   console.log("[Sync] 已连接到 PostgREST 数据库");
 
-  // 5. 获取 effectiveUserVid
-  let effectiveUserVid = await getWrVidFromCookie();
-  if (!effectiveUserVid) {
-    effectiveUserVid =
-      notebookData.userVid ||
-      notebookData.vid ||
-      notebookData.books?.[0]?.userVid ||
-      notebookData.books?.[0]?.vid ||
-      "";
-    if (effectiveUserVid) {
-      effectiveUserVid = String(effectiveUserVid);
-    }
-  }
-  if (!effectiveUserVid && books.length > 0) {
-    const firstMark = await fetch(
-      `https://weread.qq.com/web/book/bookmarklist?bookId=${books[0].bookId}&synckey=0`
-    ).then((r) => r.json());
-    effectiveUserVid = firstMark?.userVid || firstMark?.user?.vid || "";
-  }
-  if (!effectiveUserVid) {
-    effectiveUserVid = "unknown_user";
-  }
+  // 5. 统一获取 effectiveUserVid
+  const effectiveUserVid = await resolveEffectiveUserVid(notebookData);
 
   // 7. 并行获取所有书籍数据（提高速度）
   console.log(`[Sync] 开始并行获取 ${books.length} 本书的数据...`);

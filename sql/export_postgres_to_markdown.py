@@ -367,8 +367,27 @@ def generate_book_markdown(
             note_text = (hl.get("note_text") or "").strip()
             hl_id = hl.get("id")
 
-            if mark_text:
-                lines.append(f"> {mark_text}")
+            # 使用 Callout 包裹原文和评论
+            if mark_text or note_text:
+                if mark_text and note_text:
+                    callout_title = "原文与评论"
+                elif mark_text:
+                    callout_title = "原文"
+                else:
+                    callout_title = "评论"
+
+                callout_lines = [f"> [!quote]- {callout_title}"]
+                if mark_text:
+                    callout_lines.append("> **原文：**")
+                    for mline in mark_text.splitlines():
+                        callout_lines.append(f"> > {mline}")
+                if note_text:
+                    if mark_text:
+                        callout_lines.append(">")
+                    callout_lines.append("> **评论：**")
+                    for nline in note_text.splitlines():
+                        callout_lines.append(f"> {nline}")
+                lines.extend(callout_lines)
 
             # 相关概念链接
             expansions_for_hl = hl_expansion_map.get(hl_id, [])
@@ -386,10 +405,6 @@ def generate_book_markdown(
                 if link_strs:
                     lines.append("")
                     lines.append("（相关概念: " + "、".join(link_strs) + "）")
-
-            if note_text:
-                lines.append("")
-                lines.append(f"{note_text}")
 
             lines.append("")
             lines.append("---")

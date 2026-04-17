@@ -6,13 +6,26 @@ SQLite 到 PostgreSQL 数据迁移脚本
 
 import sqlite3
 import json
+import os
+import sys
 import urllib.request
 import urllib.error
 from datetime import datetime
 
-# 配置
-SQLITE_DB_PATH = r"C:\Users\sloy\Downloads\wereader_notes (2).db"
-POSTGREST_URL = "http://43.139.41.82:3000"
+# 默认配置（可通过环境变量或命令行参数覆盖）
+DEFAULT_POSTGREST_URL = "http://43.139.41.82:3000"
+
+
+def get_config():
+    """从环境变量和命令行参数读取配置"""
+    import argparse
+    parser = argparse.ArgumentParser(description="SQLite 到 PostgreSQL 数据迁移")
+    parser.add_argument("sqlite_path", help="SQLite 数据库文件路径")
+    parser.add_argument("--postgrest-url", default=os.environ.get("POSTGREST_URL", DEFAULT_POSTGREST_URL), help="PostgREST URL")
+    parser.add_argument("--jwt-token", default=os.environ.get("POSTGREST_JWT_TOKEN", ""), help="JWT Token（如已启用 JWT 认证则必填）")
+    parser.add_argument("--yes", action="store_true", help="自动确认，不再询问")
+    args = parser.parse_args()
+    return args
 
 
 def sqlite_to_iso_timestamp(ts):
@@ -28,25 +41,30 @@ def sqlite_to_iso_timestamp(ts):
     return str(ts)
 
 
-def postgrest_insert(table, data):
+def postgrest_insert(table, data, postgrest_url, jwt_token):
     """通过 PostgREST 插入数据"""
-    url = f"{POSTGREST_URL}/{table}"
+    url = f"{postgrest_url}/{table}"
     headers = {
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal"
     }
+    if jwt_token:
+        headers["Authorization"] = f"Bearer {jwt_token}"
 
     # 处理数据类型
+    payload = {}
     for key, value in data.items():
         if value is None:
             continue
         # 布尔值转换
         if isinstance(value, bool):
-            data[key] = int(value)
+            payload[key] = int(value)
+        else:
+            payload[key] = value
 
     req = urllib.request.Request(
         url,
-        data=json.dumps(data).encode('utf-8'),
+        data=json.dumps(payload).encode('utf-8'),
         headers=headers,
         method='POST'
     )
@@ -63,7 +81,7 @@ def postgrest_insert(table, data):
         return False
 
 
-def migrate_users(sqlite_conn):
+def migrate_users(sqlite_conn, postgrest_url, jwt_token):
     """迁移 users 表"""
     print("\n=== 迁移 users 表 ===")
     cursor = sqlite_conn.cursor()
@@ -79,7 +97,7 @@ def migrate_users(sqlite_conn):
             "user_name": user_name or "",
             "first_seen_at": sqlite_to_iso_timestamp(first_seen_at) or datetime.now().isoformat()
         }
-        if postgrest_insert("users", data):
+        if postgrest_insert("users", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -89,7 +107,7 @@ def migrate_users(sqlite_conn):
     return success, failed
 
 
-def migrate_books(sqlite_conn):
+def migrate_books(sqlite_conn, postgrest_url, jwt_token):
     """迁移 books 表"""
     print("\n=== 迁移 books 表 ===")
     cursor = sqlite_conn.cursor()
@@ -108,7 +126,7 @@ def migrate_books(sqlite_conn):
             "format": format or "epub",
             "created_at": sqlite_to_iso_timestamp(created_at) or datetime.now().isoformat()
         }
-        if postgrest_insert("books", data):
+        if postgrest_insert("books", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -117,7 +135,7 @@ def migrate_books(sqlite_conn):
     return success, failed
 
 
-def migrate_chapters(sqlite_conn):
+def migrate_chapters(sqlite_conn, postgrest_url, jwt_token):
     """迁移 chapters 表"""
     print("\n=== 迁移 chapters 表 ===")
     cursor = sqlite_conn.cursor()
@@ -134,7 +152,7 @@ def migrate_chapters(sqlite_conn):
             "chapter_idx": chapter_idx or 0,
             "title": title or ""
         }
-        if postgrest_insert("chapters", data):
+        if postgrest_insert("chapters", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -143,7 +161,7 @@ def migrate_chapters(sqlite_conn):
     return success, failed
 
 
-def migrate_highlights(sqlite_conn):
+def migrate_highlights(sqlite_conn, postgrest_url, jwt_token):
     """迁移 highlights 表"""
     print("\n=== 迁移 highlights 表 ===")
     cursor = sqlite_conn.cursor()
@@ -175,7 +193,7 @@ def migrate_highlights(sqlite_conn):
             "updated_at": sqlite_to_iso_timestamp(updated_at)
         }
 
-        if postgrest_insert("highlights", data):
+        if postgrest_insert("highlights", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -190,7 +208,7 @@ def migrate_highlights(sqlite_conn):
     return success, failed
 
 
-def migrate_sync_state(sqlite_conn):
+def migrate_sync_state(sqlite_conn, postgrest_url, jwt_token):
     """迁移 sync_state 表"""
     print("\n=== 迁移 sync_state 表 ===")
     cursor = sqlite_conn.cursor()
@@ -217,7 +235,7 @@ def migrate_sync_state(sqlite_conn):
             "finish_reading_at": sqlite_to_iso_timestamp(finish_reading_at)
         }
 
-        if postgrest_insert("sync_state", data):
+        if postgrest_insert("sync_state", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -226,7 +244,7 @@ def migrate_sync_state(sqlite_conn):
     return success, failed
 
 
-def migrate_knowledge_expansions(sqlite_conn):
+def migrate_knowledge_expansions(sqlite_conn, postgrest_url, jwt_token):
     """迁移 knowledge_expansions 表"""
     print("\n=== 迁移 knowledge_expansions 表 ===")
     cursor = sqlite_conn.cursor()
@@ -272,7 +290,7 @@ def migrate_knowledge_expansions(sqlite_conn):
             "updated_at": sqlite_to_iso_timestamp(updated_at)
         }
 
-        if postgrest_insert("knowledge_expansions", data):
+        if postgrest_insert("knowledge_expansions", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -286,7 +304,7 @@ def migrate_knowledge_expansions(sqlite_conn):
     return success, failed
 
 
-def migrate_knowledge_source_links(sqlite_conn):
+def migrate_knowledge_source_links(sqlite_conn, postgrest_url, jwt_token):
     """迁移 knowledge_source_links 表"""
     print("\n=== 迁移 knowledge_source_links 表 ===")
     cursor = sqlite_conn.cursor()
@@ -310,7 +328,7 @@ def migrate_knowledge_source_links(sqlite_conn):
             "created_at": sqlite_to_iso_timestamp(created_at)
         }
 
-        if postgrest_insert("knowledge_source_links", data):
+        if postgrest_insert("knowledge_source_links", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -319,7 +337,7 @@ def migrate_knowledge_source_links(sqlite_conn):
     return success, failed
 
 
-def migrate_book_exports(sqlite_conn):
+def migrate_book_exports(sqlite_conn, postgrest_url, jwt_token):
     """迁移 book_exports 表"""
     print("\n=== 迁移 book_exports 表 ===")
     cursor = sqlite_conn.cursor()
@@ -350,7 +368,7 @@ def migrate_book_exports(sqlite_conn):
             "updated_at": sqlite_to_iso_timestamp(updated_at)
         }
 
-        if postgrest_insert("book_exports", data):
+        if postgrest_insert("book_exports", data, postgrest_url, jwt_token):
             success += 1
         else:
             failed += 1
@@ -369,23 +387,25 @@ def get_sqlite_counts(sqlite_conn):
         try:
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
             counts[table] = cursor.fetchone()[0]
-        except:
+        except Exception:
             counts[table] = 0
     return counts
 
 
-def get_postgres_counts():
+def get_postgres_counts(postgrest_url, jwt_token):
     """获取 PostgreSQL 各表数据条数"""
-    import urllib.request
     counts = {}
     tables = ['users', 'books', 'chapters', 'highlights', 'sync_state',
               'knowledge_expansions', 'knowledge_source_links', 'book_exports']
 
     for table in tables:
         try:
+            headers = {"Accept": "application/json"}
+            if jwt_token:
+                headers["Authorization"] = f"Bearer {jwt_token}"
             req = urllib.request.Request(
-                f"{POSTGREST_URL}/{table}?select=count",
-                headers={"Accept": "application/json"}
+                f"{postgrest_url}/{table}?select=count",
+                headers=headers
             )
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode('utf-8'))
@@ -397,19 +417,19 @@ def get_postgres_counts():
 
 
 def main():
-    import sys
-    auto_confirm = len(sys.argv) > 1 and sys.argv[1] == '--yes'
+    args = get_config()
 
     print("=" * 60)
     print("SQLite 到 PostgreSQL 数据迁移")
     print("=" * 60)
-    print(f"SQLite 数据库: {SQLITE_DB_PATH}")
-    print(f"PostgREST API: {POSTGREST_URL}")
+    print(f"SQLite 数据库: {args.sqlite_path}")
+    print(f"PostgREST API: {args.postgrest_url}")
+    print(f"JWT 认证: {'已配置' if args.jwt_token else '未配置'}")
 
     # 连接 SQLite
     print("\n连接 SQLite 数据库...")
     try:
-        sqlite_conn = sqlite3.connect(SQLITE_DB_PATH)
+        sqlite_conn = sqlite3.connect(args.sqlite_path)
     except Exception as e:
         print(f"连接 SQLite 失败: {e}")
         return
@@ -422,7 +442,7 @@ def main():
 
     # 确认迁移
     print("\n" + "=" * 60)
-    if auto_confirm:
+    if args.yes:
         print("自动确认模式 (--yes)")
         response = 'yes'
     else:
@@ -434,14 +454,14 @@ def main():
 
     # 执行迁移（按依赖顺序）
     results = {}
-    results['users'] = migrate_users(sqlite_conn)
-    results['books'] = migrate_books(sqlite_conn)
-    results['chapters'] = migrate_chapters(sqlite_conn)
-    results['highlights'] = migrate_highlights(sqlite_conn)
-    results['sync_state'] = migrate_sync_state(sqlite_conn)
-    results['knowledge_expansions'] = migrate_knowledge_expansions(sqlite_conn)
-    results['knowledge_source_links'] = migrate_knowledge_source_links(sqlite_conn)
-    results['book_exports'] = migrate_book_exports(sqlite_conn)
+    results['users'] = migrate_users(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['books'] = migrate_books(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['chapters'] = migrate_chapters(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['highlights'] = migrate_highlights(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['sync_state'] = migrate_sync_state(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['knowledge_expansions'] = migrate_knowledge_expansions(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['knowledge_source_links'] = migrate_knowledge_source_links(sqlite_conn, args.postgrest_url, args.jwt_token)
+    results['book_exports'] = migrate_book_exports(sqlite_conn, args.postgrest_url, args.jwt_token)
 
     # 关闭连接
     sqlite_conn.close()
@@ -460,7 +480,7 @@ def main():
 
     # 验证 PostgreSQL 数据
     print("\n=== 验证 PostgreSQL 数据条数 ===")
-    pg_counts = get_postgres_counts()
+    pg_counts = get_postgres_counts(args.postgrest_url, args.jwt_token)
     for table, count in pg_counts.items():
         print(f"  {table}: {count}")
 

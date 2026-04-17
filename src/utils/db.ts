@@ -7,6 +7,26 @@ const DEFAULT_POSTGREST_URL = "http://43.139.41.82:3000";
 
 // 模块级缓存，减少频繁读取 storage
 let cachedPostgrestUrl: string | null = null;
+let cachedJwtToken: string | null = null;
+
+/**
+ * 从扩展存储中获取 PostgREST 配置
+ */
+async function getPostgrestConfig(): Promise<{ url: string; jwtToken: string }> {
+  try {
+    if (typeof browser !== "undefined" && browser.storage) {
+      const res = await browser.storage.local.get("wereader_postgrest_config");
+      const config = res["wereader_postgrest_config"];
+      return {
+        url: config?.postgrestUrl?.trim() || DEFAULT_POSTGREST_URL,
+        jwtToken: config?.jwtToken?.trim() || "",
+      };
+    }
+  } catch (e) {
+    console.error("[db] 读取 PostgREST 配置失败:", e);
+  }
+  return { url: DEFAULT_POSTGREST_URL, jwtToken: "" };
+}
 
 /**
  * 从扩展存储中获取 PostgREST URL，未配置时返回默认值
@@ -15,36 +35,46 @@ export async function getPostgrestUrl(): Promise<string> {
   if (cachedPostgrestUrl) {
     return cachedPostgrestUrl;
   }
-  try {
-    if (typeof browser !== "undefined" && browser.storage) {
-      const res = await browser.storage.local.get("wereader_postgrest_config");
-      const config = res["wereader_postgrest_config"];
-      cachedPostgrestUrl = config?.postgrestUrl?.trim() || DEFAULT_POSTGREST_URL;
-    } else {
-      cachedPostgrestUrl = DEFAULT_POSTGREST_URL;
-    }
-  } catch (e) {
-    console.error("[db] 读取 PostgREST URL 失败:", e);
-    cachedPostgrestUrl = DEFAULT_POSTGREST_URL;
-  }
-  return cachedPostgrestUrl || DEFAULT_POSTGREST_URL;
+  const config = await getPostgrestConfig();
+  cachedPostgrestUrl = config.url;
+  cachedJwtToken = config.jwtToken;
+  return cachedPostgrestUrl;
 }
 
 /**
- * 清除 PostgREST URL 缓存
+ * 从扩展存储中获取 JWT Token
+ */
+export async function getJwtToken(): Promise<string> {
+  if (cachedJwtToken !== null) {
+    return cachedJwtToken;
+  }
+  const config = await getPostgrestConfig();
+  cachedPostgrestUrl = config.url;
+  cachedJwtToken = config.jwtToken;
+  return cachedJwtToken;
+}
+
+/**
+ * 清除 PostgREST 配置缓存
  */
 export function invalidatePostgrestUrlCache(): void {
   cachedPostgrestUrl = null;
+  cachedJwtToken = null;
 }
 
 /**
  * 获取 API 请求的基础配置
  */
-function getHeaders(): Record<string, string> {
-  return {
+async function getHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "Prefer": "return=representation",
   };
+  const token = await getJwtToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  return headers;
 }
 
 /**
@@ -56,7 +86,7 @@ async function request(
   body?: unknown,
   prefer?: string
 ): Promise<any> {
-  const headers = getHeaders();
+  const headers = await getHeaders();
   if (prefer) {
     headers["Prefer"] = prefer;
   }
@@ -88,7 +118,8 @@ async function request(
 export async function initSqlite(): Promise<void> {
   try {
     const postgrestUrl = await getPostgrestUrl();
-    const response = await fetch(postgrestUrl);
+    const headers = await getHeaders();
+    const response = await fetch(postgrestUrl, { headers });
     if (!response.ok) {
       throw new Error(`PostgREST 服务不可用: ${response.status}`);
     }
@@ -99,7 +130,8 @@ export async function initSqlite(): Promise<void> {
       "无法连接到 PostgREST 服务。\n" +
       "请检查:\n" +
       "1. PostgREST 服务是否已启动 (默认: http://43.139.41.82:3000)\n" +
-      "2. 网络连接是否正常"
+      "2. JWT Token 是否配置正确\n" +
+      "3. 网络连接是否正常"
     );
   }
 }
@@ -702,19 +734,152 @@ export async function getUserSyncStats(db: any, userVid: string): Promise<any> {
 }
 
 /**
+ * 查询一本书的所有章节
+ */
+export async function getChaptersByBook(db: any, bookId: string): Promise<any[]> {
+  try {
+    const result = await request(
+      "GET",
+      `/chapters?book_id=eq.${encodeURIComponent(bookId)}&order=chapter_idx.asc`
+    );
+
+    if (!result || result.length === 0) {
+      return [];
+    }
+
+    return result.map((row: any) => ({
+      chapter_uid: row.chapter_uid,
+      chapter_idx: row.chapter_idx,
+      title: row.title,
+    }));
+  } catch (error) {
+    console.error("[getChaptersByBook] 查询失败:", error);
+    return [];
+  }
+}
+
+/**
+ * 查询单本书的同步状态
+ */
+export async function getSyncStateByBook(
+  db: any,
+  userVid: string,
+  bookId: string
+): Promise<any | null> {
+  try {
+    const result = await request(
+      "GET",
+      `/sync_state?user_vid=eq.${encodeURIComponent(userVid)}&book_id=eq.${encodeURIComponent(bookId)}&limit=1`
+    );
+
+    if (!result || result.length === 0) {
+      return null;
+    }
+
+    const row = result[0];
+    return {
+      user_vid: row.user_vid,
+      book_id: row.book_id,
+      sync_key: row.sync_key,
+      last_sync_at: row.last_sync_at,
+      reading_time: row.reading_time,
+      start_reading_at: row.start_reading_at,
+      finish_reading_at: row.finish_reading_at,
+    };
+  } catch (error) {
+    console.error("[getSyncStateByBook] 查询失败:", error);
+    return null;
+  }
+}
+
+/**
+ * 查询用户的所有知识点扩展
+ */
+export async function getKnowledgeExpansionsByUser(
+  db: any,
+  userVid: string
+): Promise<any[]> {
+  try {
+    const result = await request(
+      "GET",
+      `/knowledge_expansions?user_vid=eq.${encodeURIComponent(userVid)}`
+    );
+
+    if (!result || result.length === 0) {
+      return [];
+    }
+
+    return result.map((row: any) => ({
+      expansion_id: row.expansion_id,
+      user_vid: row.user_vid,
+      highlight_id: row.highlight_id,
+      concept_id: row.concept_id,
+      concept_name: row.concept_name,
+      concept_type: row.concept_type,
+      concept_aliases: row.concept_aliases,
+      section_definition: row.section_definition,
+      section_simple: row.section_simple,
+      section_key_points: row.section_key_points,
+      section_timeline: row.section_timeline,
+      section_related: row.section_related,
+      section_learning_path: row.section_learning_path,
+      section_notes: row.section_notes,
+      section_diagram: row.section_diagram,
+      updated_at: row.updated_at,
+    }));
+  } catch (error) {
+    console.error("[getKnowledgeExpansionsByUser] 查询失败:", error);
+    return [];
+  }
+}
+
+/**
+ * 批量查询知识点扩展的关联链接
+ */
+export async function getKnowledgeSourceLinksByExpansions(
+  db: any,
+  expansionIds: (number | string)[]
+): Promise<any[]> {
+  try {
+    if (!expansionIds || expansionIds.length === 0) {
+      return [];
+    }
+
+    const idsStr = expansionIds.join(",");
+    const result = await request(
+      "GET",
+      `/knowledge_source_links?expansion_id=in.(${encodeURIComponent(idsStr)})`
+    );
+
+    if (!result || result.length === 0) {
+      return [];
+    }
+
+    return result.map((row: any) => ({
+      link_id: row.link_id,
+      expansion_id: row.expansion_id,
+      highlight_id: row.highlight_id,
+    }));
+  } catch (error) {
+    console.error("[getKnowledgeSourceLinksByExpansions] 查询失败:", error);
+    return [];
+  }
+}
+
+/**
  * 获取表中特定用户的记录数
  */
 async function getTableCount(table: string, userVid: string): Promise<number> {
   try {
     const postgrestUrl = await getPostgrestUrl();
+    const headers = await getHeaders();
+    headers["Prefer"] = "count=exact";
     // 方法1: 使用 Range 头获取总数
     const response = await fetch(
       `${postgrestUrl}/${table}?user_vid=eq.${encodeURIComponent(userVid)}`,
       {
         method: "HEAD",
-        headers: {
-          "Prefer": "count=exact"
-        }
+        headers
       }
     );
 
